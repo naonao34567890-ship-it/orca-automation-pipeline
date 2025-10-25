@@ -1,6 +1,8 @@
 import time
 import smtplib
 import threading
+import platform
+import subprocess
 from email.mime.text import MIMEText
 try:
     import winsound
@@ -20,6 +22,7 @@ class NotificationSystem:
         self.threshold = int(config['notification']['threshold'])
         self.debounce = int(config['notification']['debounce_seconds'])
         self._monitoring = False
+        self.is_windows = platform.system() == 'Windows'
         
     def start_monitoring(self, job_manager):
         self._monitoring = True
@@ -60,7 +63,8 @@ class NotificationSystem:
             except:
                 pass
         
-        # Desktop popup notification
+        # Desktop popup notification (plyer first)
+        popup_done = False
         if notification:
             try:
                 notification.notify(
@@ -68,10 +72,19 @@ class NotificationSystem:
                     message=message,
                     timeout=10
                 )
+                popup_done = True
             except:
-                pass
+                popup_done = False
         
-        # Gmail notification
+        # Windows Toast fallback via PowerShell if plyer not available/failed
+        if self.is_windows and not popup_done:
+            try:
+                self._windows_toast("ORCA Pipeline", message)
+                popup_done = True
+            except Exception as e:
+                print(f"[TOAST ERROR] {e}")
+        
+        # Gmail notification (always)
         self._send_gmail("ORCA Pipeline Alert", message)
     
     def _send_gmail(self, subject, body):
@@ -97,19 +110,37 @@ class NotificationSystem:
         except Exception as e:
             print(f"[GMAIL ERROR] {e}")
     
+    def _windows_toast(self, title: str, message: str, duration: int = 5):
+        """Send Windows 10+ Toast notification via PowerShell without extra modules."""
+        if not self.is_windows:
+            return
+        ps_script = f"""
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+        $template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+        $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
+        $textNodes = $xml.GetElementsByTagName('text')
+        $textNodes.Item(0).AppendChild($xml.CreateTextNode('{title}')) | Out-Null
+        $textNodes.Item(1).AppendChild($xml.CreateTextNode('{message}')) | Out-Null
+        $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ORCA Pipeline')
+        $notifier.Show($toast)
+        Start-Sleep -Seconds {duration}
+        """
+        subprocess.run([
+            'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_script
+        ], check=False)
+    
     @staticmethod
     def send_error(error_message):
         """Send immediate error notification"""
         print(f"[ERROR ALERT] {error_message}")
         
-        # Critical error sound
         if winsound:
             try:
                 winsound.MessageBeep(winsound.MB_ICONHAND)
             except:
                 pass
                 
-        # Error popup
         if notification:
             try:
                 notification.notify(
