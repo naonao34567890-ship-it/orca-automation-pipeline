@@ -1,0 +1,24 @@
+[paths]
+input_dir = folders/input
+waiting_dir = folders/waiting  
+working_dir = folders/working
+products_dir = folders/products
+
+[orca]
+orca_path = C:\\ORCA\\orca.exe
+method = B3LYP
+basis_set = def2-TZVP
+charge = 0
+multiplicity = 1
+nprocs = 4
+maxcore = 2048
+max_parallel_jobs = 5
+
+[notification]
+threshold = 3
+debounce_seconds = 30
+
+[gmail]
+user = your_email@gmail.com
+app_password = your_app_password_here
+recipient = your_email@gmail.com
