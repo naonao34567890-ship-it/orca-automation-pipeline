@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local config (keep secrets out of git)
+config.local.txt
+
+# Optionally ignore global config if desired (uncomment next line)
+# config.txt
