@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller (solvent & extra keywords) + logging
+ORCA Automation Pipeline - Main Controller (solvent & extra keywords) + logging + unique naming
 """
 
 import time
@@ -13,6 +13,7 @@ from watchdog.events import FileSystemEventHandler
 from job import ORCAJob, JobManager
 from notifier import NotificationSystem
 from logging_setup import get_logger
+from path_utils import unique_path
 
 logger = get_logger("pipeline")
 
@@ -30,16 +31,18 @@ class XYZHandler(FileSystemEventHandler):
             logger.info(f"DETECT New XYZ: {xyz_path.name}")
             try:
                 inp_content = self._generate_inp_from_xyz(xyz_path)
-                inp_path = xyz_path.with_suffix('.inp')
-                inp_path.write_text(inp_content, encoding='utf-8')
-                self._move_to_waiting(xyz_path, inp_path)
+                # first write alongside xyz, then move with unique name
+                tmp_inp = xyz_path.with_suffix('.inp')
+                tmp_inp.write_text(inp_content, encoding='utf-8')
+                self._move_to_waiting_unique(xyz_path, tmp_inp)
+                final_inp = self.waiting_dir / tmp_inp.name
                 job = ORCAJob(
-                    inp_path=self.waiting_dir / inp_path.name,
+                    inp_path=final_inp,
                     xyz_path=self.waiting_dir / xyz_path.name,
                     job_type='opt'
                 )
                 self.job_manager.add_job(job)
-                logger.info(f"QUEUE Added opt job for {inp_path.name}")
+                logger.info(f"QUEUE Added opt job for {final_inp.name}")
             except Exception as e:
                 logger.exception(f"Failed to process {xyz_path.name}: {e}")
                 NotificationSystem.send_error(f"INP generation failed: {xyz_path.name}\nError: {e}")
@@ -78,12 +81,21 @@ class XYZHandler(FileSystemEventHandler):
         inp.append('*')
         return "\n".join(inp) + "\n"
 
-    def _move_to_waiting(self, xyz_path: Path, inp_path: Path):
+    def _move_to_waiting_unique(self, xyz_path: Path, inp_path: Path):
         import shutil
         self.waiting_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(xyz_path), str(self.waiting_dir / xyz_path.name))
-        shutil.move(str(inp_path), str(self.waiting_dir / inp_path.name))
-        logger.info(f"MOVE -> waiting: {xyz_path.name}, {inp_path.name}")
+        # ensure unique targets
+        dst_xyz = unique_path(self.waiting_dir / xyz_path.name)
+        dst_inp = unique_path(self.waiting_dir / inp_path.name)
+        shutil.move(str(xyz_path), str(dst_xyz))
+        shutil.move(str(inp_path), str(dst_inp))
+        # rename local names to final for job creation
+        xyz_path.rename(dst_xyz) if xyz_path.exists() else None
+        inp_path.rename(dst_inp) if inp_path.exists() else None
+        # overwrite names so caller picks waiting versions
+        xyz_path = dst_xyz
+        inp_path = dst_inp
+        logger.info(f"MOVE -> waiting: {dst_xyz.name}, {dst_inp.name}")
 
 
 class ORCAPipeline:
