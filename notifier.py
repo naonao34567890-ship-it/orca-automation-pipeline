@@ -24,6 +24,8 @@ class NotificationSystem:
         self.debounce = int(config['notification']['debounce_seconds'])
         self._monitoring = False
         self.is_windows = platform.system() == 'Windows'
+        # 追加: 閾値クロス検出用の前回カウント
+        self.last_task_count = float('inf')
         
     def start_monitoring(self, job_manager):
         self._monitoring = True
@@ -41,30 +43,32 @@ class NotificationSystem:
     def _monitor_loop(self, job_manager):
         while self._monitoring:
             try:
-                weighted_count = job_manager.get_weighted_task_count()
-                
-                if (weighted_count <= self.threshold and 
-                    time.time() - self.last_notification > self.debounce):
-                    
-                    message = f"ORCA Pipeline Alert\nRemaining tasks: {weighted_count}"
+                current = job_manager.get_weighted_task_count()
+                # 通知条件: 前回 > 閾値 かつ 今回 <= 閾値（+ デバウンス）
+                if (
+                    self.last_task_count > self.threshold and 
+                    current <= self.threshold and
+                    time.time() - self.last_notification > self.debounce
+                ):
+                    message = f"ORCA Pipeline Alert\nRemaining weighted tasks: {current}"
                     self._send_notifications(message)
                     self.last_notification = time.time()
-                    
+                # 前回値を更新
+                self.last_task_count = current
                 time.sleep(5)
             except Exception as e:
                 print(f"[NOTIFY ERROR] {e}")
+                time.sleep(5)
     
     def _send_notifications(self, message):
         print(f"[NOTIFY] {message}")
         
-        # Windows sound notification
         if winsound:
             try:
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             except:
                 pass
         
-        # Desktop popup notification (plyer first)
         popup_done = False
         if notification:
             try:
@@ -77,7 +81,6 @@ class NotificationSystem:
             except:
                 popup_done = False
         
-        # Windows Toast fallback via PowerShell if plyer not available/failed
         if self.is_windows and not popup_done:
             try:
                 self._windows_toast("ORCA Pipeline", message)
@@ -85,11 +88,9 @@ class NotificationSystem:
             except Exception as e:
                 print(f"[TOAST ERROR] {e}")
         
-        # Gmail notification (always)
         self._send_gmail("ORCA Pipeline Alert", message)
     
     def _send_gmail(self, subject, body):
-        """Send Gmail notification with env var fallback."""
         try:
             gmail_user = os.getenv('GMAIL_USER') or self.config['gmail']['user']
             gmail_password = (os.getenv('GMAIL_APP_PASSWORD') or self.config['gmail']['app_password']).replace(' ', '')
@@ -112,8 +113,7 @@ class NotificationSystem:
             print(f"[GMAIL ERROR] {e}")
     
     def _windows_toast(self, title: str, message: str, duration: int = 5):
-        """Send Windows 10+ Toast notification via PowerShell without extra modules."""
-        if not self.is_windows:
+        if platform.system() != 'Windows':
             return
         ps_script = f"""
         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -133,15 +133,12 @@ class NotificationSystem:
     
     @staticmethod
     def send_error(error_message):
-        """Send immediate error notification"""
         print(f"[ERROR ALERT] {error_message}")
-        
         if winsound:
             try:
                 winsound.MessageBeep(winsound.MB_ICONHAND)
             except:
                 pass
-                
         if notification:
             try:
                 notification.notify(
