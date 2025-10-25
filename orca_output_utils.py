@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Utility helpers for ORCA outputs: resolve primary output file and parse termination.
+Updated with safe reading for concurrent .log file access.
 """
 
 from pathlib import Path
 from typing import Optional, Tuple
 import re
+from safe_file_utils import safe_read_text, is_orca_definitely_complete
 
 
 def resolve_primary_output(work_dir: Path, stem: str) -> Optional[Path]:
@@ -31,13 +33,32 @@ def resolve_primary_output(work_dir: Path, stem: str) -> Optional[Path]:
 
 
 def parse_normal_termination(text: str) -> Tuple[bool, Optional[str]]:
-    if 'ORCA TERMINATED NORMALLY' in text:
+    """Parse ORCA output text for completion/error status.
+    
+    Returns:
+        (success, error_message)
+        success=True: Normal termination
+        success=False: Error or incomplete
+    """
+    is_complete, is_error, error_reason = is_orca_definitely_complete(text)
+    
+    if is_complete and not is_error:
         return True, None
-    patterns = [
-        r'ERROR', r'Unknown key', r'UNKNOWN KEY', r'SCF NOT CONVERGED',
-        r'CONVERGENCE NOT REACHED', r'OPTIMIZATION FAILED', r'ABORTING THE RUN'
-    ]
-    for pat in patterns:
-        if re.search(pat, text, flags=re.IGNORECASE):
-            return False, f"Detected error pattern: {pat}"
-    return False, 'No normal termination marker found'
+    elif is_complete and is_error:
+        return False, error_reason
+    else:
+        # Incomplete - should be requeued, not marked as permanent failure
+        return False, f"Incomplete/interrupted: {error_reason}"
+
+
+def safe_parse_orca_output(out_path: Path) -> Tuple[bool, Optional[str]]:
+    """Safely read and parse ORCA output with retry logic.
+    
+    Returns:
+        (success, error_message) 
+    """
+    text = safe_read_text(out_path)
+    if text is None:
+        return False, f"Could not read output file: {out_path.name}"
+    
+    return parse_normal_termination(text)
