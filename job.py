@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Job Management (Complete) - 22nd Century Programer Bot
-- ORCAExecutor with subprocess
-- Output parsing (normal termination, error patterns)
-- opt -> freq chaining with geometry extraction
-- Working/products directory management
+ORCA Job Management (Crash-safe) - adds state persistence, lock files, and recovery
 """
 
 import re
+import os
+import json
 import time
 import queue
 import shutil
 import subprocess
 import threading
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional, Dict
+
+from state_store import StateStore
 
 
 class JobType:
@@ -41,10 +41,34 @@ class ORCAJob:
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     error_message: Optional[str] = None
+    retries: int = 0
 
     @property
     def weight(self) -> int:
         return 2 if self.job_type == JobType.OPT else 1
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        # Serialize Paths to strings
+        for k in ['inp_path', 'xyz_path', 'work_dir']:
+            if d.get(k) is not None:
+                d[k] = str(d[k])
+        return d
+
+    @staticmethod
+    def from_dict(d: Dict):
+        return ORCAJob(
+            inp_path=Path(d['inp_path']),
+            xyz_path=Path(d['xyz_path']),
+            job_type=d['job_type'],
+            job_id=d.get('job_id'),
+            status=d.get('status', JobStatus.WAITING),
+            work_dir=Path(d['work_dir']) if d.get('work_dir') else None,
+            start_time=d.get('start_time'),
+            end_time=d.get('end_time'),
+            error_message=d.get('error_message'),
+            retries=int(d.get('retries', 0))
+        )
 
 
 class ORCAExecutor:
@@ -55,6 +79,10 @@ class ORCAExecutor:
         job.work_dir = work_dir
         job.start_time = time.time()
         job.status = JobStatus.RUNNING
+
+        # Create lock file to mark running
+        lock_path = work_dir / '.lock'
+        lock_path.write_text('running', encoding='utf-8')
 
         # Copy input files
         shutil.copy2(job.inp_path, work_dir)
@@ -92,12 +120,18 @@ class ORCAExecutor:
             job.error_message = f"Execution exception: {e}"
             job.end_time = time.time()
             return False
+        finally:
+            # Remove lock if exists
+            try:
+                if lock_path.exists():
+                    lock_path.unlink()
+            except Exception:
+                pass
 
     def _parse_output(self, out_path: Path) -> (bool, Optional[str]):
         content = out_path.read_text(encoding='utf-8', errors='ignore')
         if 'ORCA TERMINATED NORMALLY' in content:
             return True, None
-        # Common error patterns
         patterns = [
             r'ERROR', r'Unknown key', r'UNKNOWN KEY', r'SCF NOT CONVERGED',
             r'CONVERGENCE NOT REACHED', r'OPTIMIZATION FAILED', r'ABORTING THE RUN'
@@ -108,16 +142,13 @@ class ORCAExecutor:
         return False, 'No normal termination marker found'
 
     def extract_final_xyz(self, out_path: Path) -> Optional[str]:
-        """Extract final optimized coordinates as XYZ block"""
         try:
             text = out_path.read_text(encoding='utf-8', errors='ignore')
-            # Heuristic: look for 'CARTESIAN COORDINATES (ANGSTROEM)' last block
             blocks = list(re.finditer(r'CARTESIAN COORDINATES \(ANGSTROEM\)([\s\S]*?)\n\s*\n', text))
             if not blocks:
                 return None
             last = blocks[-1].group(1)
             lines = [ln for ln in last.strip().splitlines() if ln.strip()]
-            # Filter header lines until atomic lines start (start with element symbol)
             coords = []
             for ln in lines:
                 parts = ln.split()
@@ -141,23 +172,29 @@ class JobManager:
         self.running = {}
         self.completed = []
         self.max_parallel = int(config['orca']['max_parallel_jobs'])
+        self.max_retries = int(config['orca'].get('max_retries', 2))
         self.executor = ORCAExecutor(config['orca']['orca_path'])
         self.working_dir = Path(config['paths']['working_dir'])
         self.products_dir = Path(config['paths']['products_dir'])
         self.waiting_dir = Path(config['paths']['waiting_dir'])
+        self.state_dir = Path('folders/state')
+        self.state = StateStore(self.state_dir)
         self._run = False
         self._lock = threading.Lock()
 
-        # Ensure directories exist
-        for p in [self.working_dir, self.products_dir, self.waiting_dir]:
+        for p in [self.working_dir, self.products_dir, self.waiting_dir, self.state_dir]:
             p.mkdir(parents=True, exist_ok=True)
 
     def add_job(self, job: ORCAJob):
+        if job.job_id is None:
+            job.job_id = f"{job.inp_path.stem}_{job.job_type}_{int(time.time()*1000)}"
         print(f"[QUEUE] {job.job_type} -> {job.inp_path.name}")
+        self.state.enqueue(job.to_dict())
         self.job_queue.put(job)
 
     def start(self):
         self._run = True
+        self._recover_on_start()
         for i in range(self.max_parallel):
             t = threading.Thread(target=self._worker, name=f"ORCA-{i+1}", daemon=True)
             t.start()
@@ -168,10 +205,8 @@ class JobManager:
 
     def get_weighted_task_count(self) -> int:
         total = 0
-        # queued
         for j in list(self.job_queue.queue):
             total += j.weight
-        # running
         with self._lock:
             for j in self.running.values():
                 total += j.weight
@@ -185,18 +220,34 @@ class JobManager:
                 work_dir.mkdir(parents=True, exist_ok=True)
                 with self._lock:
                     self.running[work_dir.name] = job
-                print(f"[EXEC] {job.job_type} {work_dir.name}")
+                # move state: queue -> running
+                self.state.dequeue(job.job_id)
+                rj = job.to_dict(); rj['work_dir'] = str(work_dir)
+                self.state.add_running(rj)
 
+                print(f"[EXEC] {job.job_type} {work_dir.name}")
                 ok = self.executor.run(job, work_dir)
 
                 with self._lock:
                     self.running.pop(work_dir.name, None)
                     self.completed.append(job)
 
-                # Archive
+                # running -> completed or retry
+                self.state.remove_running(job.job_id)
+                if ok:
+                    self.state.append_completed(job.to_dict())
+                else:
+                    if job.retries < self.max_retries:
+                        job.retries += 1
+                        print(f"[RETRY] {job.job_id} ({job.retries}/{self.max_retries})")
+                        self.add_job(job)
+                    else:
+                        from notifier import NotificationSystem
+                        NotificationSystem.send_error(f"Job failed after retries: {job.job_id}\n{job.error_message}")
+                        self.state.append_completed(job.to_dict())
+
                 self._archive(work_dir, job)
 
-                # Chain opt -> freq
                 if ok and job.job_type == JobType.OPT:
                     out_path = self.products_dir / work_dir.name / f"{job.inp_path.stem}.out"
                     xyz_block = self.executor.extract_final_xyz(out_path)
@@ -228,14 +279,69 @@ class JobManager:
         multiplicity = int(self.config['orca']['multiplicity'])
         nprocs = self.config['orca']['nprocs']
         maxcore = self.config['orca']['maxcore']
+        # solvent/extras from config
+        solvent_model = self.config['orca'].get('solvent_model', 'none').strip().lower()
+        solvent_name = self.config['orca'].get('solvent_name', 'water').strip()
+        extra_keywords = self.config['orca'].get('extra_keywords', '').strip()
+        solvent_kw = ''
+        if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
+            solvent_kw = f" {solvent_model.upper()}(Solvent={solvent_name.capitalize()})"
+        first = f"! {method} {basis} Freq{solvent_kw}"
+        if extra_keywords:
+            first += f" {extra_keywords}"
         lines = xyz_block.strip().splitlines()
-        natoms = len(lines)
         coords = "\n".join(lines)
         return (
-            f"! {method} {basis} Freq\n\n"
+            f"{first}\n\n"
             f"%pal nprocs {nprocs} end\n"
             f"%maxcore {maxcore}\n\n"
             f"* xyz {charge} {multiplicity}\n"
             f"{coords}\n"
             f"*\n"
         )
+
+    def _recover_on_start(self):
+        print("[RECOVER] Starting recovery...")
+        # 1) Re-queue queued jobs from state
+        queued = [ORCAJob.from_dict(j) for j in self.state.load_queue()]
+        for j in queued:
+            print(f"[RECOVER] queued -> requeue {j.job_id}")
+            self.job_queue.put(j)
+        # 2) Handle running jobs
+        running = [ORCAJob.from_dict(j) for j in self.state.load_running()]
+        for j in running:
+            wd = Path(j.work_dir) if j.work_dir else None
+            if wd and (wd / f"{j.inp_path.stem}.out").exists():
+                ok, _ = ORCAExecutor(self.config['orca']['orca_path'])._parse_output(wd / f"{j.inp_path.stem}.out")
+                # archive into products if not yet
+                target = self.products_dir / wd.name
+                if not target.exists() and wd.exists():
+                    target.mkdir(parents=True, exist_ok=True)
+                    for f in wd.iterdir():
+                        shutil.move(str(f), str(target / f.name))
+                    wd.rmdir()
+                # finalize state
+                self.state.remove_running(j.job_id)
+                if ok:
+                    print(f"[RECOVER] running(ok) -> completed {j.job_id}")
+                    self.state.append_completed(j.to_dict())
+                else:
+                    print(f"[RECOVER] running(failed) -> requeue {j.job_id}")
+                    j.status = JobStatus.WAITING
+                    self.state.enqueue(j.to_dict())
+                    self.job_queue.put(j)
+            else:
+                # No output -> incomplete, requeue
+                print(f"[RECOVER] running(incomplete) -> requeue {j.job_id}")
+                j.status = JobStatus.WAITING
+                self.state.enqueue(j.to_dict())
+                self.job_queue.put(j)
+                self.state.remove_running(j.job_id)
+        # 3) Scan waiting dir for orphan inputs
+        for inp in self.waiting_dir.glob('*.inp'):
+            xyz = self.waiting_dir / (inp.stem.replace('_freq','') + '.xyz')
+            job_type = JobType.FREQ if inp.stem.endswith('_freq') else JobType.OPT
+            job = ORCAJob(inp_path=inp, xyz_path=xyz if xyz.exists() else Path(''), job_type=job_type)
+            print(f"[RECOVER] waiting -> enqueue {inp.name}")
+            self.add_job(job)
+        print("[RECOVER] Done")
