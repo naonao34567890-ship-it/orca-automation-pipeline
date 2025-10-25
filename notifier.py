@@ -1,3 +1,4 @@
+import os
 import time
 import smtplib
 import threading
@@ -88,11 +89,11 @@ class NotificationSystem:
         self._send_gmail("ORCA Pipeline Alert", message)
     
     def _send_gmail(self, subject, body):
-        """Send Gmail notification with app password"""
+        """Send Gmail notification with env var fallback."""
         try:
-            gmail_user = self.config['gmail']['user']
-            gmail_password = self.config['gmail']['app_password']
-            recipient = self.config['gmail']['recipient']
+            gmail_user = os.getenv('GMAIL_USER') or self.config['gmail']['user']
+            gmail_password = (os.getenv('GMAIL_APP_PASSWORD') or self.config['gmail']['app_password']).replace(' ', '')
+            recipient = os.getenv('GMAIL_RECIPIENT') or self.config['gmail']['recipient']
             
             msg = MIMEText(body)
             msg['Subject'] = subject
