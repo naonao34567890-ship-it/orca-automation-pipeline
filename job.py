@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Job Management (Crash-safe + logging)
+ORCA Job Management (Crash-safe + logging) - patch to support .out/_orca.log resolution
 """
 
 import re
@@ -17,6 +17,7 @@ from typing import Optional, Dict
 
 from state_store import StateStore
 from logging_setup import get_logger
+from orca_output_utils import resolve_primary_output, parse_normal_termination
 
 log = get_logger("jobs")
 
@@ -100,22 +101,24 @@ class ORCAExecutor:
             )
             job.end_time = time.time()
 
-            out_file = work_dir / f"{job.inp_path.stem}.out"
-            if not out_file.exists():
+            # Resolve output file among .out/_orca.log/.log candidates
+            out_path = resolve_primary_output(work_dir, job.inp_path.stem)
+            if not out_path or not out_path.exists():
                 job.status = JobStatus.ERROR
-                job.error_message = f"Output missing: {out_file.name}\nSTDERR: {proc.stderr[:500]}"
+                job.error_message = f"Primary output not found (searched .out/_orca.log/.log). STDERR: {proc.stderr[:500]}"
                 log.error(f"EXEC fail {job.job_id}: {job.error_message}")
                 return False
 
-            ok, err = self._parse_output(out_file)
+            text = out_path.read_text(encoding='utf-8', errors='ignore')
+            ok, err = parse_normal_termination(text)
             if ok:
                 job.status = JobStatus.COMPLETED
-                log.info(f"EXEC ok {job.job_id} duration={job.end_time-job.start_time:.1f}s")
+                log.info(f"EXEC ok {job.job_id} output={out_path.name} duration={job.end_time-job.start_time:.1f}s")
                 return True
             else:
                 job.status = JobStatus.ERROR
                 job.error_message = err or 'Unknown ORCA error'
-                log.error(f"EXEC error {job.job_id}: {job.error_message}")
+                log.error(f"EXEC error {job.job_id}: {job.error_message} (output={out_path.name})")
                 return False
 
         except Exception as e:
@@ -130,19 +133,6 @@ class ORCAExecutor:
                     lock_path.unlink()
             except Exception:
                 pass
-
-    def _parse_output(self, out_path: Path) -> (bool, Optional[str]):
-        content = out_path.read_text(encoding='utf-8', errors='ignore')
-        if 'ORCA TERMINATED NORMALLY' in content:
-            return True, None
-        patterns = [
-            r'ERROR', r'Unknown key', r'UNKNOWN KEY', r'SCF NOT CONVERGED',
-            r'CONVERGENCE NOT REACHED', r'OPTIMIZATION FAILED', r'ABORTING THE RUN'
-        ]
-        for pat in patterns:
-            if re.search(pat, content, flags=re.IGNORECASE):
-                return False, f"Detected error pattern: {pat}"
-        return False, 'No normal termination marker found'
 
     def extract_final_xyz(self, out_path: Path) -> Optional[str]:
         try:
@@ -253,8 +243,12 @@ class JobManager:
                 self._archive(work_dir, job)
 
                 if ok and job.job_type == JobType.OPT:
-                    out_path = self.products_dir / work_dir.name / f"{job.inp_path.stem}.out"
-                    xyz_block = self.executor.extract_final_xyz(out_path)
+                    # Use resolved output again for coordinate extraction
+                    out_path = resolve_primary_output(self.products_dir / work_dir.name, job.inp_path.stem)
+                    if out_path:
+                        xyz_block = self.executor.extract_final_xyz(out_path)
+                    else:
+                        xyz_block = None
                     if xyz_block:
                         freq_inp = self._make_freq_inp(job, xyz_block)
                         freq_inp_path = self.waiting_dir / f"{job.inp_path.stem}_freq.inp"
@@ -313,11 +307,18 @@ class JobManager:
         running = [ORCAJob.from_dict(j) for j in self.state.load_running()]
         for j in running:
             wd = Path(j.work_dir) if j.work_dir else None
-            out_path = wd / f"{j.inp_path.stem}.out" if wd else None
-            if wd and out_path and out_path.exists():
-                ok, _ = ORCAExecutor(self.config['orca']['orca_path'])._parse_output(out_path)
-                target = self.products_dir / wd.name
-                if not target.exists() and wd.exists():
+            # Try resolve output in wd or archived products
+            out_path = None
+            if wd and wd.exists():
+                out_path = resolve_primary_output(wd, j.inp_path.stem)
+            if not out_path:
+                archived = self.products_dir / (wd.name if wd else '')
+                if archived.exists():
+                    out_path = resolve_primary_output(archived, j.inp_path.stem)
+            if out_path and out_path.exists():
+                ok, _ = parse_normal_termination(out_path.read_text(encoding='utf-8', errors='ignore'))
+                target = self.products_dir / (wd.name if wd else out_path.parent.name)
+                if wd and wd.exists() and not target.exists():
                     target.mkdir(parents=True, exist_ok=True)
                     for f in wd.iterdir():
                         shutil.move(str(f), str(target / f.name))
