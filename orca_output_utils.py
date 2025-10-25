@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Utility helpers for ORCA outputs: resolve primary output file and parse termination.
-Updated with safe reading for concurrent .log file access.
+Updated to handle recoverable vs fatal error classification.
 """
 
 from pathlib import Path
@@ -33,32 +33,38 @@ def resolve_primary_output(work_dir: Path, stem: str) -> Optional[Path]:
 
 
 def parse_normal_termination(text: str) -> Tuple[bool, Optional[str]]:
-    """Parse ORCA output text for completion/error status.
+    """Parse ORCA output text for completion/error status (legacy 2-value interface).
     
     Returns:
         (success, error_message)
-        success=True: Normal termination
-        success=False: Error or incomplete
     """
-    is_complete, is_error, error_reason = is_orca_definitely_complete(text)
+    is_complete, is_recoverable, is_fatal, error_reason = is_orca_definitely_complete(text)
     
-    if is_complete and not is_error:
+    if is_complete and not is_recoverable and not is_fatal:
         return True, None
-    elif is_complete and is_error:
-        return False, error_reason
     else:
-        # Incomplete - should be requeued, not marked as permanent failure
-        return False, f"Incomplete/interrupted: {error_reason}"
+        return False, error_reason
 
 
-def safe_parse_orca_output(out_path: Path) -> Tuple[bool, Optional[str]]:
-    """Safely read and parse ORCA output with retry logic.
+def safe_parse_orca_output(out_path: Path) -> Tuple[bool, bool, bool, Optional[str]]:
+    """Safely read and parse ORCA output with retry logic and error classification.
     
     Returns:
-        (success, error_message) 
+        (success, is_recoverable_error, is_fatal_error, error_message)
     """
     text = safe_read_text(out_path)
     if text is None:
-        return False, f"Could not read output file: {out_path.name}"
+        # File read failure - treat as fatal (likely permission/disk issues)
+        return False, False, True, f"Could not read output file: {out_path.name}"
     
-    return parse_normal_termination(text)
+    is_complete, is_recoverable, is_fatal, error_reason = is_orca_definitely_complete(text)
+    
+    if is_complete and not is_recoverable and not is_fatal:
+        return True, False, False, None
+    elif is_complete and is_fatal:
+        return False, False, True, error_reason
+    elif is_complete and is_recoverable:
+        return False, True, False, error_reason
+    else:
+        # Incomplete - should be requeued, not marked as permanent failure
+        return False, False, False, f"Incomplete/interrupted: {error_reason}"
