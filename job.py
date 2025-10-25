@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Job Management (Crash-safe + logging) - uses safe_parse_orca_output for robust parsing
+ORCA Job Management (Crash-safe + logging) - group products by molecule/type and generate Molden
 """
 
 import time
@@ -113,7 +113,6 @@ class ORCAExecutor:
                 log.info(f"EXEC ok {job.job_id} output={out_path.name} duration={job.end_time-job.start_time:.1f}s")
                 return True
             else:
-                # err may indicate incomplete or a real error; store message and let retry policy handle
                 job.status = JobStatus.ERROR
                 job.error_message = err or 'Unknown ORCA error'
                 log.error(f"EXEC error {job.job_id}: {job.error_message} (output={out_path.name})")
@@ -205,6 +204,45 @@ class JobManager:
                 total += j.weight
         return total
 
+    def _molecule_name(self, stem: str) -> str:
+        # remove trailing _opt/_freq if present
+        if stem.endswith('_opt'):
+            return stem[:-4]
+        if stem.endswith('_freq'):
+            return stem[:-5]
+        return stem
+
+    def _archive(self, work_dir: Path, job: ORCAJob):
+        # Group by molecule name and job type
+        stem = job.inp_path.stem
+        mol = self._molecule_name(stem)
+        job_folder = f"{job.job_type}_{int(time.time())}"
+        base_target = self.products_dir / mol / job_folder
+        target = unique_path(base_target)
+        target.mkdir(parents=True, exist_ok=True)
+        for f in work_dir.iterdir():
+            shutil.move(str(f), str(target / f.name))
+        work_dir.rmdir()
+        log.info(f"ARCHIVE {job.job_id} -> {target.relative_to(self.products_dir)}")
+
+        # Optional: generate Molden from GBW
+        try:
+            gen = self.config['orca'].getboolean('generate_molden', fallback=True)
+        except Exception:
+            gen = True
+        if gen:
+            gbws = list(target.glob('*.gbw'))
+            if gbws:
+                orca_2mkl = self.config['orca'].get('orca_2mkl_path', 'orca_2mkl')
+                base = gbws[0].with_suffix('')  # remove .gbw
+                cmd = [orca_2mkl, str(base), '-molden']
+                try:
+                    subprocess.run(cmd, cwd=target, check=False, capture_output=True)
+                    # orca_2mkl creates basename.molden.input in cwd
+                    log.info(f"MOLDEN generated for {gbws[0].name}")
+                except Exception as e:
+                    log.warning(f"MOLDEN generation failed: {e}")
+
     def _worker(self):
         while self._run:
             try:
@@ -242,14 +280,17 @@ class JobManager:
                 self._archive(work_dir, job)
 
                 if ok and job.job_type == JobType.OPT:
-                    out_path = resolve_primary_output(self.products_dir / work_dir.name, job.inp_path.stem)
+                    out_path = resolve_primary_output(self.products_dir / self._molecule_name(job.inp_path.stem) / next((p.name for p in (self.products_dir / self._molecule_name(job.inp_path.stem)).iterdir() if p.is_dir() and job.job_type in p.name), ''), job.inp_path.stem)
+                    # Fallback: use archived subfolder name we just created
+                    if not out_path:
+                        last_dir = max((self.products_dir / self._molecule_name(job.inp_path.stem)).iterdir(), key=lambda d: d.stat().st_mtime if d.is_dir() else 0)
+                        out_path = resolve_primary_output(last_dir, job.inp_path.stem)
                     if out_path:
-                        # reuse safe parser path for coordinate extraction source
                         xyz_block = self.executor.extract_final_xyz(out_path)
                     else:
                         xyz_block = None
                     if xyz_block:
-                        freq_inp_path = unique_path(self.waiting_dir / f"{job.inp_path.stem}_freq.inp")
+                        freq_inp_path = unique_path(self.waiting_dir / f"{self._molecule_name(job.inp_path.stem)}_freq.inp")
                         freq_inp_path.write_text(self._make_freq_inp(job, xyz_block))
                         freq_job = ORCAJob(inp_path=freq_inp_path, xyz_path=job.xyz_path, job_type=JobType.FREQ)
                         self.add_job(freq_job)
@@ -260,14 +301,6 @@ class JobManager:
                 continue
             except Exception as e:
                 log.exception(f"WORKER error: {e}")
-
-    def _archive(self, work_dir: Path, job: ORCAJob):
-        target = unique_path(self.products_dir / work_dir.name)
-        target.mkdir(parents=True, exist_ok=True)
-        for f in work_dir.iterdir():
-            shutil.move(str(f), str(target / f.name))
-        work_dir.rmdir()
-        log.info(f"ARCHIVE {job.job_id} -> {target.name}")
 
     def _make_freq_inp(self, opt_job: ORCAJob, xyz_block: str) -> str:
         method = self.config['orca']['method']
@@ -307,17 +340,17 @@ class JobManager:
             if wd and wd.exists():
                 out_path = resolve_primary_output(wd, j.inp_path.stem)
             if not out_path:
-                archived = self.products_dir / (wd.name if wd else '')
-                if archived.exists():
-                    out_path = resolve_primary_output(archived, j.inp_path.stem)
+                mol = self._molecule_name(j.inp_path.stem)
+                mol_dir = self.products_dir / mol
+                if mol_dir.exists():
+                    # use most recent subdir
+                    subdirs = [d for d in mol_dir.iterdir() if d.is_dir()]
+                    if subdirs:
+                        last_dir = max(subdirs, key=lambda d: d.stat().st_mtime)
+                        out_path = resolve_primary_output(last_dir, j.inp_path.stem)
             if out_path and out_path.exists():
                 success, err = safe_parse_orca_output(out_path)
-                target = unique_path(self.products_dir / (wd.name if wd else out_path.parent.name))
-                if wd and wd.exists() and not target.exists():
-                    target.mkdir(parents=True, exist_ok=True)
-                    for f in wd.iterdir():
-                        shutil.move(str(f), str(target / f.name))
-                    wd.rmdir()
+                # already archived in molecule grouping structure, nothing to move from wd here
                 self.state.remove_running(j.job_id)
                 if success:
                     self.state.append_completed(j.to_dict())
