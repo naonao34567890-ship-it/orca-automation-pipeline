@@ -1,6 +1,8 @@
+# ORCA Automation Pipeline - Configuration
+
 [paths]
 input_dir = folders/input
-waiting_dir = folders/waiting  
+waiting_dir = folders/waiting
 working_dir = folders/working
 products_dir = folders/products
 
@@ -13,6 +15,15 @@ multiplicity = 1
 nprocs = 4
 maxcore = 2048
 max_parallel_jobs = 5
+
+# Optional extensions
+# solvent_model: none | CPCM | SMD | COSMO
+# solvent_name: water, methanol, acetonitrile, toluene, etc. (per ORCA keywords)
+# e.g., solvent_model = CPCM and solvent_name = water will emit:  CPCM(Solvent=Water)
+solvent_model = none
+solvent_name = water
+# Extra ORCA keywords appended to the first line (after method/basis)
+extra_keywords = 
 
 [notification]
 threshold = 3
