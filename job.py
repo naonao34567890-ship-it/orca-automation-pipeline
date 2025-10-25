@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Job Management (Crash-safe) - adds state persistence, lock files, and recovery
+ORCA Job Management (Crash-safe + logging)
 """
 
 import re
 import os
-import json
 import time
 import queue
 import shutil
@@ -17,6 +16,9 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Dict
 
 from state_store import StateStore
+from logging_setup import get_logger
+
+log = get_logger("jobs")
 
 
 class JobType:
@@ -49,7 +51,6 @@ class ORCAJob:
 
     def to_dict(self) -> Dict:
         d = asdict(self)
-        # Serialize Paths to strings
         for k in ['inp_path', 'xyz_path', 'work_dir']:
             if d.get(k) is not None:
                 d[k] = str(d[k])
@@ -80,16 +81,15 @@ class ORCAExecutor:
         job.start_time = time.time()
         job.status = JobStatus.RUNNING
 
-        # Create lock file to mark running
         lock_path = work_dir / '.lock'
         lock_path.write_text('running', encoding='utf-8')
 
-        # Copy input files
         shutil.copy2(job.inp_path, work_dir)
         if job.xyz_path.exists():
             shutil.copy2(job.xyz_path, work_dir)
 
         cmd = [self.orca_path, job.inp_path.name]
+        log.info(f"EXEC start {job.job_id} in {work_dir.name}: {' '.join(cmd)}")
         try:
             proc = subprocess.run(
                 cmd,
@@ -103,25 +103,28 @@ class ORCAExecutor:
             out_file = work_dir / f"{job.inp_path.stem}.out"
             if not out_file.exists():
                 job.status = JobStatus.ERROR
-                job.error_message = f"Output file not found: {out_file.name}\nSTDERR: {proc.stderr}"
+                job.error_message = f"Output missing: {out_file.name}\nSTDERR: {proc.stderr[:500]}"
+                log.error(f"EXEC fail {job.job_id}: {job.error_message}")
                 return False
 
             ok, err = self._parse_output(out_file)
             if ok:
                 job.status = JobStatus.COMPLETED
+                log.info(f"EXEC ok {job.job_id} duration={job.end_time-job.start_time:.1f}s")
                 return True
             else:
                 job.status = JobStatus.ERROR
                 job.error_message = err or 'Unknown ORCA error'
+                log.error(f"EXEC error {job.job_id}: {job.error_message}")
                 return False
 
         except Exception as e:
             job.status = JobStatus.ERROR
             job.error_message = f"Execution exception: {e}"
             job.end_time = time.time()
+            log.exception(f"EXEC exception {job.job_id}: {e}")
             return False
         finally:
-            # Remove lock if exists
             try:
                 if lock_path.exists():
                     lock_path.unlink()
@@ -188,9 +191,9 @@ class JobManager:
     def add_job(self, job: ORCAJob):
         if job.job_id is None:
             job.job_id = f"{job.inp_path.stem}_{job.job_type}_{int(time.time()*1000)}"
-        print(f"[QUEUE] {job.job_type} -> {job.inp_path.name}")
         self.state.enqueue(job.to_dict())
         self.job_queue.put(job)
+        log.info(f"QUEUE add {job.job_id} ({job.job_type})")
 
     def start(self):
         self._run = True
@@ -198,10 +201,11 @@ class JobManager:
         for i in range(self.max_parallel):
             t = threading.Thread(target=self._worker, name=f"ORCA-{i+1}", daemon=True)
             t.start()
-        print(f"[WORKERS] {self.max_parallel} workers up")
+        log.info(f"WORKERS started: {self.max_parallel}")
 
     def stop(self):
         self._run = False
+        log.info("WORKERS stop requested")
 
     def get_weighted_task_count(self) -> int:
         total = 0
@@ -220,31 +224,31 @@ class JobManager:
                 work_dir.mkdir(parents=True, exist_ok=True)
                 with self._lock:
                     self.running[work_dir.name] = job
-                # move state: queue -> running
                 self.state.dequeue(job.job_id)
                 rj = job.to_dict(); rj['work_dir'] = str(work_dir)
                 self.state.add_running(rj)
 
-                print(f"[EXEC] {job.job_type} {work_dir.name}")
+                log.info(f"EXEC dispatch {job.job_id} -> {work_dir.name}")
                 ok = self.executor.run(job, work_dir)
 
                 with self._lock:
                     self.running.pop(work_dir.name, None)
                     self.completed.append(job)
 
-                # running -> completed or retry
                 self.state.remove_running(job.job_id)
                 if ok:
                     self.state.append_completed(job.to_dict())
+                    log.info(f"DONE {job.job_id}")
                 else:
                     if job.retries < self.max_retries:
                         job.retries += 1
-                        print(f"[RETRY] {job.job_id} ({job.retries}/{self.max_retries})")
+                        log.warning(f"RETRY {job.job_id} ({job.retries}/{self.max_retries})")
                         self.add_job(job)
                     else:
                         from notifier import NotificationSystem
                         NotificationSystem.send_error(f"Job failed after retries: {job.job_id}\n{job.error_message}")
                         self.state.append_completed(job.to_dict())
+                        log.error(f"FAIL {job.job_id}: {job.error_message}")
 
                 self._archive(work_dir, job)
 
@@ -257,12 +261,13 @@ class JobManager:
                         freq_inp_path.write_text(freq_inp)
                         freq_job = ORCAJob(inp_path=freq_inp_path, xyz_path=job.xyz_path, job_type=JobType.FREQ)
                         self.add_job(freq_job)
+                        log.info(f"CHAIN {job.job_id} -> {freq_job.job_id}")
 
                 self.job_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"[WORKER ERROR] {e}")
+                log.exception(f"WORKER error: {e}")
 
     def _archive(self, work_dir: Path, job: ORCAJob):
         target = self.products_dir / work_dir.name
@@ -270,7 +275,7 @@ class JobManager:
         for f in work_dir.iterdir():
             shutil.move(str(f), str(target / f.name))
         work_dir.rmdir()
-        print(f"[ARCHIVE] -> {target}")
+        log.info(f"ARCHIVE {job.job_id} -> {target.name}")
 
     def _make_freq_inp(self, opt_job: ORCAJob, xyz_block: str) -> str:
         method = self.config['orca']['method']
@@ -279,7 +284,6 @@ class JobManager:
         multiplicity = int(self.config['orca']['multiplicity'])
         nprocs = self.config['orca']['nprocs']
         maxcore = self.config['orca']['maxcore']
-        # solvent/extras from config
         solvent_model = self.config['orca'].get('solvent_model', 'none').strip().lower()
         solvent_name = self.config['orca'].get('solvent_name', 'water').strip()
         extra_keywords = self.config['orca'].get('extra_keywords', '').strip()
@@ -301,47 +305,42 @@ class JobManager:
         )
 
     def _recover_on_start(self):
-        print("[RECOVER] Starting recovery...")
-        # 1) Re-queue queued jobs from state
+        log.info("RECOVER begin")
         queued = [ORCAJob.from_dict(j) for j in self.state.load_queue()]
         for j in queued:
-            print(f"[RECOVER] queued -> requeue {j.job_id}")
             self.job_queue.put(j)
-        # 2) Handle running jobs
+            log.info(f"RECOVER queue->requeue {j.job_id}")
         running = [ORCAJob.from_dict(j) for j in self.state.load_running()]
         for j in running:
             wd = Path(j.work_dir) if j.work_dir else None
-            if wd and (wd / f"{j.inp_path.stem}.out").exists():
-                ok, _ = ORCAExecutor(self.config['orca']['orca_path'])._parse_output(wd / f"{j.inp_path.stem}.out")
-                # archive into products if not yet
+            out_path = wd / f"{j.inp_path.stem}.out" if wd else None
+            if wd and out_path and out_path.exists():
+                ok, _ = ORCAExecutor(self.config['orca']['orca_path'])._parse_output(out_path)
                 target = self.products_dir / wd.name
                 if not target.exists() and wd.exists():
                     target.mkdir(parents=True, exist_ok=True)
                     for f in wd.iterdir():
                         shutil.move(str(f), str(target / f.name))
                     wd.rmdir()
-                # finalize state
                 self.state.remove_running(j.job_id)
                 if ok:
-                    print(f"[RECOVER] running(ok) -> completed {j.job_id}")
                     self.state.append_completed(j.to_dict())
+                    log.info(f"RECOVER running(ok)->completed {j.job_id}")
                 else:
-                    print(f"[RECOVER] running(failed) -> requeue {j.job_id}")
                     j.status = JobStatus.WAITING
                     self.state.enqueue(j.to_dict())
                     self.job_queue.put(j)
+                    log.warning(f"RECOVER running(failed)->requeue {j.job_id}")
             else:
-                # No output -> incomplete, requeue
-                print(f"[RECOVER] running(incomplete) -> requeue {j.job_id}")
                 j.status = JobStatus.WAITING
                 self.state.enqueue(j.to_dict())
                 self.job_queue.put(j)
                 self.state.remove_running(j.job_id)
-        # 3) Scan waiting dir for orphan inputs
+                log.warning(f"RECOVER running(incomplete)->requeue {j.job_id}")
         for inp in self.waiting_dir.glob('*.inp'):
             xyz = self.waiting_dir / (inp.stem.replace('_freq','') + '.xyz')
             job_type = JobType.FREQ if inp.stem.endswith('_freq') else JobType.OPT
             job = ORCAJob(inp_path=inp, xyz_path=xyz if xyz.exists() else Path(''), job_type=job_type)
-            print(f"[RECOVER] waiting -> enqueue {inp.name}")
             self.add_job(job)
-        print("[RECOVER] Done")
+            log.info(f"RECOVER waiting->enqueue {inp.name}")
+        log.info("RECOVER end")
