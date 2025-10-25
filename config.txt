@@ -8,6 +8,8 @@ products_dir = folders/products
 
 [orca]
 orca_path = C:\\ORCA\\orca.exe
+orca_2mkl_path = C:\\ORCA\\orca_2mkl.exe
+generate_molden = true
 method = B3LYP
 basis_set = def2-TZVP
 charge = 0
