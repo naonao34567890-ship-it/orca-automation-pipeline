@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Job Management (Crash-safe + logging) - group products by molecule/type and generate Molden
+ORCA Job Management with recoverable/fatal error handling, energy plots, and system grouping
 """
 
 import time
@@ -17,6 +17,7 @@ from state_store import StateStore
 from logging_setup import get_logger
 from orca_output_utils import resolve_primary_output, safe_parse_orca_output
 from path_utils import unique_path, unique_job_id
+from energy_plot_utils import create_energy_plot_from_output
 
 log = get_logger("jobs")
 
@@ -76,7 +77,7 @@ class ORCAExecutor:
     def __init__(self, orca_path: str):
         self.orca_path = orca_path
 
-    def run(self, job: ORCAJob, work_dir: Path) -> bool:
+    def run(self, job: ORCAJob, work_dir: Path) -> tuple[bool, bool, bool]:  # (success, is_recoverable, is_fatal)
         job.work_dir = work_dir
         job.start_time = time.time()
         job.status = JobStatus.RUNNING
@@ -105,25 +106,36 @@ class ORCAExecutor:
                 job.status = JobStatus.ERROR
                 job.error_message = f"Primary output not found (searched .out/_orca.log/.log). STDERR: {proc.stderr[:500]}"
                 log.error(f"EXEC fail {job.job_id}: {job.error_message}")
-                return False
+                return False, False, True  # No output = fatal
 
-            success, err = safe_parse_orca_output(out_path)
+            success, is_recoverable, is_fatal, err = safe_parse_orca_output(out_path)
             if success:
                 job.status = JobStatus.COMPLETED
                 log.info(f"EXEC ok {job.job_id} output={out_path.name} duration={job.end_time-job.start_time:.1f}s")
-                return True
-            else:
+                return True, False, False
+            elif is_fatal:
                 job.status = JobStatus.ERROR
-                job.error_message = err or 'Unknown ORCA error'
-                log.error(f"EXEC error {job.job_id}: {job.error_message} (output={out_path.name})")
-                return False
+                job.error_message = err or 'Fatal ORCA error'
+                log.error(f"EXEC fatal {job.job_id}: {job.error_message} (output={out_path.name})")
+                return False, False, True
+            elif is_recoverable:
+                job.status = JobStatus.ERROR
+                job.error_message = err or 'Recoverable ORCA error'
+                log.warning(f"EXEC recoverable {job.job_id}: {job.error_message} (output={out_path.name})")
+                return False, True, False
+            else:
+                # Incomplete
+                job.status = JobStatus.ERROR
+                job.error_message = err or 'Incomplete execution'
+                log.warning(f"EXEC incomplete {job.job_id}: {job.error_message}")
+                return False, False, False
 
         except Exception as e:
             job.status = JobStatus.ERROR
             job.error_message = f"Execution exception: {e}"
             job.end_time = time.time()
             log.exception(f"EXEC exception {job.job_id}: {e}")
-            return False
+            return False, False, True  # Exception = fatal
         finally:
             try:
                 if lock_path.exists():
@@ -172,6 +184,7 @@ class JobManager:
         self.state = StateStore(self.state_dir)
         self._run = False
         self._lock = threading.Lock()
+        self._fatal_error_occurred = False
 
         for p in [self.working_dir, self.products_dir, self.waiting_dir, self.state_dir]:
             p.mkdir(parents=True, exist_ok=True)
@@ -195,6 +208,9 @@ class JobManager:
         self._run = False
         log.info("WORKERS stop requested")
 
+    def has_fatal_error(self) -> bool:
+        return self._fatal_error_occurred
+
     def get_weighted_task_count(self) -> int:
         total = 0
         for j in list(self.job_queue.queue):
@@ -205,50 +221,75 @@ class JobManager:
         return total
 
     def _molecule_name(self, stem: str) -> str:
-        # remove trailing _opt/_freq if present
         if stem.endswith('_opt'):
             return stem[:-4]
         if stem.endswith('_freq'):
             return stem[:-5]
         return stem
 
-    def _archive(self, work_dir: Path, job: ORCAJob):
-        # Group by molecule name and job type
+    def _archive(self, work_dir: Path, job: ORCAJob, success: bool, is_recoverable: bool, is_fatal: bool):
         stem = job.inp_path.stem
         mol = self._molecule_name(stem)
-        job_folder = f"{job.job_type}_{int(time.time())}"
+        
+        # Determine folder name based on result
+        if success:
+            job_folder = f"{job.job_type}_success_{int(time.time())}"
+        elif is_fatal:
+            job_folder = f"{job.job_type}_fatal_{int(time.time())}"
+        else:
+            job_folder = f"{job.job_type}_failed_{int(time.time())}"
+        
         base_target = self.products_dir / mol / job_folder
         target = unique_path(base_target)
         target.mkdir(parents=True, exist_ok=True)
+        
         for f in work_dir.iterdir():
             shutil.move(str(f), str(target / f.name))
         work_dir.rmdir()
         log.info(f"ARCHIVE {job.job_id} -> {target.relative_to(self.products_dir)}")
 
-        # Optional: generate Molden from GBW
+        # Generate additional outputs for successful and recoverable failures
+        if success or is_recoverable:
+            self._generate_auxiliary_outputs(target, mol, job.job_type)
+
+    def _generate_auxiliary_outputs(self, target_dir: Path, molecule_name: str, job_type: str):
+        # Generate Molden if enabled
         try:
-            gen = self.config['orca'].getboolean('generate_molden', fallback=True)
+            gen_molden = self.config['orca'].getboolean('generate_molden', fallback=True)
         except Exception:
-            gen = True
-        if gen:
-            gbws = list(target.glob('*.gbw'))
+            gen_molden = True
+        
+        if gen_molden:
+            gbws = list(target_dir.glob('*.gbw'))
             if gbws:
                 orca_2mkl = self.config['orca'].get('orca_2mkl_path', 'orca_2mkl')
-                base = gbws[0].with_suffix('')  # remove .gbw
+                base = gbws[0].with_suffix('')
                 cmd = [orca_2mkl, str(base), '-molden']
                 try:
-                    subprocess.run(cmd, cwd=target, check=False, capture_output=True)
-                    # orca_2mkl creates basename.molden.input in cwd
+                    subprocess.run(cmd, cwd=target_dir, check=False, capture_output=True)
                     log.info(f"MOLDEN generated for {gbws[0].name}")
                 except Exception as e:
                     log.warning(f"MOLDEN generation failed: {e}")
+        
+        # Generate energy trajectory plot
+        out_path = resolve_primary_output(target_dir, molecule_name)
+        if out_path:
+            plot_path = target_dir / f"{molecule_name}_{job_type}_energy.png"
+            try:
+                if create_energy_plot_from_output(out_path, plot_path, molecule_name, job_type):
+                    log.info(f"ENERGY PLOT generated: {plot_path.name}")
+                else:
+                    log.info(f"ENERGY PLOT skipped (no data): {molecule_name}_{job_type}")
+            except Exception as e:
+                log.warning(f"ENERGY PLOT generation failed: {e}")
 
     def _worker(self):
-        while self._run:
+        while self._run and not self._fatal_error_occurred:
             try:
                 job: ORCAJob = self.job_queue.get(timeout=1.0)
                 work_dir = unique_path(self.working_dir / f"{job.inp_path.stem}_{job.job_type}_{int(time.time())}")
                 work_dir.mkdir(parents=True, exist_ok=True)
+                
                 with self._lock:
                     self.running[work_dir.name] = job
                 self.state.dequeue(job.job_id)
@@ -256,51 +297,78 @@ class JobManager:
                 self.state.add_running(rj)
 
                 log.info(f"EXEC dispatch {job.job_id} -> {work_dir.name}")
-                ok = self.executor.run(job, work_dir)
+                success, is_recoverable, is_fatal = self.executor.run(job, work_dir)
 
                 with self._lock:
                     self.running.pop(work_dir.name, None)
                     self.completed.append(job)
 
                 self.state.remove_running(job.job_id)
-                if ok:
+                
+                if is_fatal:
+                    # Fatal error - stop pipeline
+                    self._fatal_error_occurred = True
+                    from notifier import NotificationSystem
+                    NotificationSystem.send_error(f"FATAL ERROR - Pipeline stopped: {job.job_id}\n{job.error_message}")
+                    log.error(f"FATAL {job.job_id}: {job.error_message} - STOPPING PIPELINE")
                     self.state.append_completed(job.to_dict())
-                    log.info(f"DONE {job.job_id}")
+                    self._archive(work_dir, job, False, False, True)
+                    return  # Exit worker thread
+                
+                elif success:
+                    self.state.append_completed(job.to_dict())
+                    log.info(f"SUCCESS {job.job_id}")
+                    self._archive(work_dir, job, True, False, False)
+                    
+                    # Chain opt -> freq if successful
+                    if job.job_type == JobType.OPT:
+                        self._chain_frequency_calculation(job)
+                
+                elif is_recoverable:
+                    # Recoverable error - archive as failed but continue pipeline
+                    self.state.append_completed(job.to_dict())
+                    log.warning(f"RECOVERABLE_FAIL {job.job_id}: {job.error_message}")
+                    self._archive(work_dir, job, False, True, False)
+                
                 else:
+                    # Incomplete - retry if possible
                     if job.retries < self.max_retries:
                         job.retries += 1
                         log.warning(f"RETRY {job.job_id} ({job.retries}/{self.max_retries})")
                         self.add_job(job)
+                        self._archive(work_dir, job, False, False, False)  # Archive attempt
                     else:
-                        from notifier import NotificationSystem
-                        NotificationSystem.send_error(f"Job failed after retries: {job.job_id}\n{job.error_message}")
+                        # Max retries reached - treat as recoverable failure
                         self.state.append_completed(job.to_dict())
-                        log.error(f"FAIL {job.job_id}: {job.error_message}")
-
-                self._archive(work_dir, job)
-
-                if ok and job.job_type == JobType.OPT:
-                    out_path = resolve_primary_output(self.products_dir / self._molecule_name(job.inp_path.stem) / next((p.name for p in (self.products_dir / self._molecule_name(job.inp_path.stem)).iterdir() if p.is_dir() and job.job_type in p.name), ''), job.inp_path.stem)
-                    # Fallback: use archived subfolder name we just created
-                    if not out_path:
-                        last_dir = max((self.products_dir / self._molecule_name(job.inp_path.stem)).iterdir(), key=lambda d: d.stat().st_mtime if d.is_dir() else 0)
-                        out_path = resolve_primary_output(last_dir, job.inp_path.stem)
-                    if out_path:
-                        xyz_block = self.executor.extract_final_xyz(out_path)
-                    else:
-                        xyz_block = None
-                    if xyz_block:
-                        freq_inp_path = unique_path(self.waiting_dir / f"{self._molecule_name(job.inp_path.stem)}_freq.inp")
-                        freq_inp_path.write_text(self._make_freq_inp(job, xyz_block))
-                        freq_job = ORCAJob(inp_path=freq_inp_path, xyz_path=job.xyz_path, job_type=JobType.FREQ)
-                        self.add_job(freq_job)
-                        log.info(f"CHAIN {job.job_id} -> {freq_job.job_id}")
+                        log.warning(f"MAX_RETRY_FAIL {job.job_id}: {job.error_message}")
+                        self._archive(work_dir, job, False, True, False)
 
                 self.job_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
                 log.exception(f"WORKER error: {e}")
+
+    def _chain_frequency_calculation(self, opt_job: ORCAJob):
+        """Chain frequency calculation after successful optimization."""
+        try:
+            mol = self._molecule_name(opt_job.inp_path.stem)
+            mol_dir = self.products_dir / mol
+            if mol_dir.exists():
+                subdirs = [d for d in mol_dir.iterdir() if d.is_dir() and 'success' in d.name and 'opt' in d.name]
+                if subdirs:
+                    latest_opt = max(subdirs, key=lambda d: d.stat().st_mtime)
+                    out_path = resolve_primary_output(latest_opt, mol)
+                    if out_path:
+                        xyz_block = self.executor.extract_final_xyz(out_path)
+                        if xyz_block:
+                            freq_inp_path = unique_path(self.waiting_dir / f"{mol}_freq.inp")
+                            freq_inp_path.write_text(self._make_freq_inp(opt_job, xyz_block))
+                            freq_job = ORCAJob(inp_path=freq_inp_path, xyz_path=opt_job.xyz_path, job_type=JobType.FREQ)
+                            self.add_job(freq_job)
+                            log.info(f"CHAIN {opt_job.job_id} -> {freq_job.job_id}")
+        except Exception as e:
+            log.warning(f"CHAIN failed for {opt_job.job_id}: {e}")
 
     def _make_freq_inp(self, opt_job: ORCAJob, xyz_block: str) -> str:
         method = self.config['orca']['method']
@@ -333,6 +401,7 @@ class JobManager:
         for j in queued:
             self.job_queue.put(j)
             log.info(f"RECOVER queue->requeue {j.job_id}")
+        
         running = [ORCAJob.from_dict(j) for j in self.state.load_running()]
         for j in running:
             wd = Path(j.work_dir) if j.work_dir else None
@@ -343,18 +412,20 @@ class JobManager:
                 mol = self._molecule_name(j.inp_path.stem)
                 mol_dir = self.products_dir / mol
                 if mol_dir.exists():
-                    # use most recent subdir
                     subdirs = [d for d in mol_dir.iterdir() if d.is_dir()]
                     if subdirs:
                         last_dir = max(subdirs, key=lambda d: d.stat().st_mtime)
                         out_path = resolve_primary_output(last_dir, j.inp_path.stem)
+            
             if out_path and out_path.exists():
-                success, err = safe_parse_orca_output(out_path)
-                # already archived in molecule grouping structure, nothing to move from wd here
+                success, is_recoverable, is_fatal, err = safe_parse_orca_output(out_path)
                 self.state.remove_running(j.job_id)
                 if success:
                     self.state.append_completed(j.to_dict())
                     log.info(f"RECOVER running(ok)->completed {j.job_id}")
+                elif is_fatal:
+                    self.state.append_completed(j.to_dict())
+                    log.error(f"RECOVER running(fatal)->completed {j.job_id}")
                 else:
                     j.status = JobStatus.WAITING
                     self.state.enqueue(j.to_dict())
@@ -366,6 +437,7 @@ class JobManager:
                 self.job_queue.put(j)
                 self.state.remove_running(j.job_id)
                 log.warning(f"RECOVER running(incomplete)->requeue {j.job_id}")
+        
         for inp in self.waiting_dir.glob('*.inp'):
             xyz = self.waiting_dir / (inp.stem.replace('_freq','') + '.xyz')
             job_type = JobType.FREQ if inp.stem.endswith('_freq') else JobType.OPT
