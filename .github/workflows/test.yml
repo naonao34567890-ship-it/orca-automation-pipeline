@@ -1,0 +1,374 @@
+name: ORCA Pipeline Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install watchdog matplotlib configparser pytest
+    
+    - name: Create test config
+      run: |
+        cat > config.txt << EOF
+        [paths]
+        input_dir = folders/input
+        waiting_dir = folders/waiting
+        working_dir = folders/working
+        products_dir = folders/products
+
+        [orca]
+        orca_path = /usr/bin/mock_orca
+        orca_2mkl_path = /usr/bin/mock_orca_2mkl
+        generate_molden = true
+        method = B3LYP
+        basis_set = def2-SVP
+        charge = 0
+        multiplicity = 1
+        nprocs = 2
+        maxcore = 1024
+        max_parallel_jobs = 2
+        max_retries = 1
+
+        solvent_model = CPCM
+        solvent_name = Chloroform
+        extra_keywords = 
+
+        [gmail]
+        user = test@example.com
+        app_password = testpassword
+        recipient = test@example.com
+
+        [notification]
+        threshold = 3
+        debounce_seconds = 5
+        EOF
+    
+    - name: Create mock ORCA executables
+      run: |
+        sudo mkdir -p /usr/bin
+        # Mock ORCA that generates realistic output
+        sudo tee /usr/bin/mock_orca << 'EOF'
+        #!/bin/bash
+        input_file="$1"
+        basename="${input_file%.inp}"
+        
+        # Create mock ORCA output
+        cat > "${basename}.out" << 'OUTEOF'
+        
+                                         * O   R   C   A *
+        
+                           --- An Ab Initio, DFT and Semiempirical electronic structure package ---
+        
+                                  #######################################################
+                                  #                        -***-                        #
+                                  #          Department of theory and spectroscopy      #
+                                  #    Directorship and core code : Frank Neese         #
+                                  #        Max Planck Institute for Chemical Energy     #
+                                  #                    Conversion Mulheim              #
+                                  #                       Germany                       #
+                                  #######################################################
+        
+        
+        Input file name: test.inp
+        
+        ****************************
+        * Single Point Calculation *
+        ****************************
+        
+        FINAL SINGLE POINT ENERGY        -40.123456789012
+        
+        **********************
+        GEOMETRY OPTIMIZATION
+        **********************
+        
+                            ***        THE OPTIMIZATION HAS CONVERGED     ***
+        
+        FINAL ENERGY: -40.123456789012
+        
+        CARTESIAN COORDINATES (ANGSTROEM)
+        C      0.000000    0.000000    0.000000
+        H      1.089000    0.000000    0.000000
+        H     -0.363000    1.027000    0.000000
+        H     -0.363000   -0.513500    0.889165
+        H     -0.363000   -0.513500   -0.889165
+        
+        ORCA TERMINATED NORMALLY
+        OUTEOF
+        
+        # Create mock gbw file
+        echo "Mock GBW binary data" > "${basename}.gbw"
+        
+        exit 0
+        EOF
+        
+        # Mock orca_2mkl
+        sudo tee /usr/bin/mock_orca_2mkl << 'EOF'
+        #!/bin/bash
+        basename="$1"
+        echo "Mock Molden generation" > "${basename}.molden.input"
+        exit 0
+        EOF
+        
+        sudo chmod +x /usr/bin/mock_orca /usr/bin/mock_orca_2mkl
+    
+    - name: Run pipeline tests
+      timeout-minutes: 3
+      run: |
+        # Start pipeline in background
+        python main.py &
+        PIPELINE_PID=$!
+        
+        # Wait for startup
+        sleep 2
+        
+        # Create test XYZ file
+        mkdir -p folders/input
+        cat > folders/input/test_molecule.xyz << 'EOF'
+        5
+        Test methane molecule
+        C   0.000000   0.000000   0.000000
+        H   1.089000   0.000000   0.000000
+        H  -0.363000   1.027000   0.000000
+        H  -0.363000  -0.513500   0.889165
+        H  -0.363000  -0.513500  -0.889165
+        EOF
+        
+        # Wait for processing
+        sleep 5
+        
+        # Check results
+        echo "=== Directory Structure ==="
+        find folders -type f | head -20
+        
+        echo "=== Generated INP Content ==="
+        find folders -name "*.inp" -exec cat {} \;
+        
+        echo "=== Pipeline Logs ==="
+        cat folders/logs/pipeline.log 2>/dev/null || echo "No log file found"
+        
+        echo "=== Products ==="
+        find folders/products -type f 2>/dev/null || echo "No products yet"
+        
+        # Clean shutdown
+        kill $PIPELINE_PID 2>/dev/null || true
+        
+    - name: Validate INP generation
+      run: |
+        # Check if INP was generated correctly
+        if find folders -name "*.inp" | grep -q .; then
+          echo "✅ INP file generation: PASS"
+          
+          # Check ORCA syntax
+          inp_content=$(find folders -name "*.inp" -exec cat {} \;)
+          if echo "$inp_content" | grep -q "! B3LYP def2-SVP Opt CPCM(Chloroform)"; then
+            echo "✅ ORCA syntax: PASS"
+          else
+            echo "❌ ORCA syntax: FAIL"
+            echo "Generated syntax: $inp_content"
+            exit 1
+          fi
+          
+          # Check coordinate format
+          if echo "$inp_content" | grep -q "* xyz 0 1"; then
+            echo "✅ Coordinate format: PASS"  
+          else
+            echo "❌ Coordinate format: FAIL"
+            exit 1
+          fi
+        else
+          echo "❌ INP file generation: FAIL"
+          exit 1
+        fi
+
+  mock-calculation-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install watchdog matplotlib configparser
+    
+    - name: Extended mock ORCA test
+      timeout-minutes: 5
+      run: |
+        # Create enhanced config for longer test
+        cat > config.txt << 'EOF'
+        [paths]
+        input_dir = folders/input
+        waiting_dir = folders/waiting  
+        working_dir = folders/working
+        products_dir = folders/products
+
+        [orca]
+        orca_path = ./mock_orca.sh
+        orca_2mkl_path = ./mock_orca_2mkl.sh
+        generate_molden = true
+        method = B3LYP
+        basis_set = def2-SVP
+        charge = 0
+        multiplicity = 1
+        nprocs = 2
+        maxcore = 1024
+        max_parallel_jobs = 2
+        max_retries = 1
+
+        solvent_model = CPCM
+        solvent_name = Chloroform
+        extra_keywords = 
+
+        [gmail]  
+        user = test@example.com
+        app_password = testpassword
+        recipient = test@example.com
+
+        [notification]
+        threshold = 3
+        debounce_seconds = 2
+        EOF
+        
+        # Create realistic mock ORCA with delayed output
+        cat > mock_orca.sh << 'EOF'
+        #!/bin/bash
+        input_file="$1"
+        basename="${input_file%.inp}"
+        
+        # Simulate calculation time
+        sleep 1
+        
+        # Generate log output gradually (simulating real ORCA)
+        {
+          echo "ORCA PROGRAM SYSTEM"
+          sleep 0.5
+          echo "GEOMETRY OPTIMIZATION RUNNING"
+          sleep 0.5
+          echo "CYCLE     1 Energy: -40.123456"
+          sleep 0.5  
+          echo "CYCLE     2 Energy: -40.123465"
+          sleep 0.5
+          echo "CYCLE     3 Energy: -40.123467"
+          echo "***        THE OPTIMIZATION HAS CONVERGED     ***"
+          echo "FINAL SINGLE POINT ENERGY        -40.123467891"
+          echo ""
+          echo "CARTESIAN COORDINATES (ANGSTROEM)"
+          echo "C      0.000000    0.000000    0.000000"
+          echo "H      1.089000    0.000000    0.000000" 
+          echo "H     -0.363000    1.027000    0.000000"
+          echo "H     -0.363000   -0.513500    0.889165"
+          echo "H     -0.363000   -0.513500   -0.889165"
+          echo ""
+          echo "ORCA TERMINATED NORMALLY"
+        } > "${basename}.out"
+        
+        echo "Mock binary data $(date)" > "${basename}.gbw"
+        exit 0
+        EOF
+        
+        cat > mock_orca_2mkl.sh << 'EOF'  
+        #!/bin/bash
+        basename="$1"
+        echo "Mock Molden file generated $(date)" > "${basename}.molden.input"
+        exit 0
+        EOF
+        
+        chmod +x mock_orca.sh mock_orca_2mkl.sh
+        
+        # Start pipeline
+        python main.py &
+        PIPELINE_PID=$!
+        
+        sleep 2
+        
+        # Test multiple molecules
+        mkdir -p folders/input
+        
+        # Molecule 1: Methane
+        cat > folders/input/methane.xyz << 'EOF'
+        5
+        Methane molecule
+        C   0.000000   0.000000   0.000000
+        H   1.089000   0.000000   0.000000  
+        H  -0.363000   1.027000   0.000000
+        H  -0.363000  -0.513500   0.889165
+        H  -0.363000  -0.513500  -0.889165
+        EOF
+        
+        # Wait for first job
+        sleep 8
+        
+        # Molecule 2: Ethane  
+        cat > folders/input/ethane.xyz << 'EOF'
+        8
+        Ethane molecule
+        C  -0.762000   0.000000   0.000000
+        C   0.762000   0.000000   0.000000
+        H  -1.155000   1.027000   0.000000
+        H  -1.155000  -0.513500   0.889000
+        H  -1.155000  -0.513500  -0.889000  
+        H   1.155000   1.027000   0.000000
+        H   1.155000  -0.513500   0.889000
+        H   1.155000  -0.513500  -0.889000
+        EOF
+        
+        # Wait for processing
+        sleep 8
+        
+        # Results analysis
+        echo "=== FINAL RESULTS ==="
+        echo "Directory structure:"
+        find folders -type f | sort
+        
+        echo -e "\n=== Generated INP Files ==="
+        find folders -name "*.inp" -exec echo "File: {}" \; -exec cat {} \; -exec echo "---" \;
+        
+        echo -e "\n=== Pipeline Logs ==="  
+        cat folders/logs/pipeline.log 2>/dev/null | tail -20
+        
+        echo -e "\n=== Products Structure ==="
+        find folders/products -type f 2>/dev/null | sort
+        
+        echo -e "\n=== Energy Plots ==="
+        find folders -name "*energy.png" 2>/dev/null || echo "No energy plots found"
+        
+        echo -e "\n=== Molden Files ==="
+        find folders -name "*.molden.input" 2>/dev/null || echo "No Molden files found"
+        
+        # Stop pipeline
+        kill $PIPELINE_PID 2>/dev/null || true
+        
+        # Validation
+        inp_count=$(find folders -name "*.inp" | wc -l)
+        product_count=$(find folders/products -type d -name "*success*" 2>/dev/null | wc -l)
+        
+        echo -e "\n=== VALIDATION ==="
+        echo "INP files generated: $inp_count"
+        echo "Successful products: $product_count"
+        
+        if [ "$inp_count" -ge 2 ] && [ "$product_count" -ge 1 ]; then
+          echo "✅ Pipeline test: PASS"
+        else
+          echo "❌ Pipeline test: FAIL"
+          exit 1
+        fi
