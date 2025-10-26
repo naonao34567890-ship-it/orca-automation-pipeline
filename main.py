@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller with fatal error pipeline stop and watchdog API fix
+ORCA Automation Pipeline - Main Controller with robust XYZ parsing, fatal stop, and watchdog API fix
 """
 
 import time
@@ -54,12 +54,25 @@ class XYZHandler(FileSystemEventHandler):
 
     def _generate_inp_from_xyz(self, xyz_path: Path) -> str:
         lines = xyz_path.read_text(encoding='utf-8', errors='ignore').splitlines()
-        num_atoms = int(lines[0].strip())
+        if len(lines) < 2:
+            raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines)")
+        try:
+            num_atoms = int(lines[0].strip())
+        except Exception:
+            raise ValueError(f"Invalid XYZ header: {xyz_path.name} (first line must be atom count)")
+        if len(lines) < 2 + num_atoms:
+            raise ValueError(f"Invalid XYZ file: {xyz_path.name} (missing coordinate lines)")
+
         coords = []
         for i in range(2, 2 + num_atoms):
             parts = lines[i].split()
+            if len(parts) < 4:
+                raise ValueError(f"Invalid coordinate format at line {i+1} in {xyz_path.name}")
             element = parts[0]
-            x, y, z = map(float, parts[1:4])
+            try:
+                x, y, z = map(float, parts[1:4])
+            except ValueError as ex:
+                raise ValueError(f"Invalid coordinate values at line {i+1} in {xyz_path.name}: {ex}")
             coords.append(f"{element:>2} {x:>12.6f} {y:>12.6f} {z:>12.6f}")
 
         method = self.config['orca']['method']
@@ -75,7 +88,7 @@ class XYZHandler(FileSystemEventHandler):
 
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            # Fixed: Remove 'Solvent=' for correct ORCA syntax
+            # Correct ORCA syntax
             solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
 
         first_line = f"! {method} {basis} Opt{solvent_kw}"
