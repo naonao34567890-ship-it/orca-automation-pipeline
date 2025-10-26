@@ -62,13 +62,35 @@ jobs:
           basename="${input_file%.inp}"
           sleep 1
           cat > "${basename}.out" << 'OUTEOF'
-          *** THE OPTIMIZATION HAS CONVERGED ***
+                                           * O   R   C   A *
+
+                             --- An Ab Initio, DFT and Semiempirical electronic structure package ---
+
+          ****************************
+          * Geometry Optimization     *
+          ****************************
+
+          CYCLE    1
+          Total Energy:  -40.123456
+
+          CYCLE    2
+          Total Energy:  -40.123465
+
+          CYCLE    3
+          Total Energy:  -40.123467
+
+          ***        THE OPTIMIZATION HAS CONVERGED     ***
+
+          FINAL SINGLE POINT ENERGY        -40.123467891
+
           CARTESIAN COORDINATES (ANGSTROEM)
-          C 0.000000 0.000000 0.000000
-          H 1.089000 0.000000 0.000000
-          H -0.363000 1.027000 0.000000
-          H -0.363000 -0.513500 0.889165
-          H -0.363000 -0.513500 -0.889165
+          C      0.000000    0.000000    0.000000
+          H      1.089000    0.000000    0.000000
+          H     -0.363000    1.027000    0.000000
+          H     -0.363000   -0.513500    0.889165
+          H     -0.363000   -0.513500   -0.889165
+
+          ORCA TERMINATED NORMALLY
           OUTEOF
           echo "mock" > "${basename}.gbw"
           exit 0
@@ -117,7 +139,7 @@ jobs:
       - name: Results summary
         run: |
           echo "=== Logs ===" 
-          tail -n 50 folders/logs/pipeline.log || true
+          tail -n 80 folders/logs/pipeline.log || true
           echo "=== Waiting ==="
           find folders/waiting -type f || true
           echo "=== Products ==="
