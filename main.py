@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller with robust XYZ parsing, retry logic, watchdog API fix, and explicit ORCA output directives
+ORCA Automation Pipeline - Main Controller
+- Robust XYZ parsing with retry
+- Watchdog API compatibility
+- Explicit ORCA output directives (multi-line %output)
+- Ensure folders/state exists
 """
 
 import time
@@ -26,12 +30,7 @@ class XYZHandler(FileSystemEventHandler):
         self.waiting_dir = Path(config['paths']['waiting_dir'])
 
     def on_created(self, event):
-        # Fix for different watchdog API versions
-        if hasattr(event, 'is_directory'):
-            is_dir = event.is_directory
-        else:
-            is_dir = getattr(event, 'is_dir', False)
-            
+        is_dir = getattr(event, 'is_directory', getattr(event, 'is_dir', False))
         if not is_dir and event.src_path.endswith('.xyz'):
             xyz_path = Path(event.src_path)
             logger.info(f"DETECT New XYZ: {xyz_path.name}")
@@ -53,81 +52,64 @@ class XYZHandler(FileSystemEventHandler):
                 NotificationSystem.send_error(f"INP generation failed: {xyz_path.name}\nError: {e}")
 
     def _generate_inp_from_xyz(self, xyz_path: Path) -> str:
-        # Retry logic for CI environment file buffering issues
+        # Retry logic for transient read issues
         for attempt in range(10):
             try:
                 lines = xyz_path.read_text(encoding='utf-8', errors='ignore').splitlines()
-                # Remove empty lines and normalize whitespace
                 lines = [line.strip() for line in lines if line.strip()]
-                
                 if len(lines) < 2:
                     if attempt < 9:
-                        time.sleep(0.2)
-                        continue
-                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines after {attempt+1} attempts)")
-                
+                        time.sleep(0.2); continue
+                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines)")
                 try:
                     num_atoms = int(lines[0])
                 except ValueError:
                     if attempt < 9:
-                        time.sleep(0.2)
-                        continue
+                        time.sleep(0.2); continue
                     raise ValueError(f"Invalid XYZ header: {xyz_path.name} (first line must be atom count)")
-                
                 if len(lines) < 2 + num_atoms:
                     if attempt < 9:
-                        time.sleep(0.2)
-                        continue
-                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (expected {2 + num_atoms} lines, got {len(lines)})")
-                
-                # Parse coordinates
+                        time.sleep(0.2); continue
+                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (expected {2+num_atoms} lines, got {len(lines)})")
                 coords = []
                 for i in range(2, 2 + num_atoms):
                     parts = lines[i].split()
                     if len(parts) < 4:
                         raise ValueError(f"Invalid coordinate format at line {i+1} in {xyz_path.name}")
                     element = parts[0]
-                    try:
-                        x, y, z = map(float, parts[1:4])
-                    except ValueError as ex:
-                        raise ValueError(f"Invalid coordinate values at line {i+1} in {xyz_path.name}: {ex}")
+                    x, y, z = map(float, parts[1:4])
                     coords.append(f"{element:>2} {x:>12.6f} {y:>12.6f} {z:>12.6f}")
-                
-                # Successful parsing, break retry loop
                 break
-                
             except ValueError as e:
-                if attempt == 9:  # Last attempt
-                    raise e
+                if attempt == 9: raise e
                 time.sleep(0.2)
                 continue
-        
-        # Generate ORCA input with explicit log/output directives
+
         method = self.config['orca']['method']
         basis = self.config['orca']['basis_set']
         charge = int(self.config['orca']['charge'])
         multiplicity = int(self.config['orca']['multiplicity'])
         nprocs = self.config['orca']['nprocs']
         maxcore = self.config['orca']['maxcore']
-
-        solvent_model = self.config['orca'].get('solvent_model', 'none').strip().lower()
+        solvent_model = self.config['orca'].get('solvent_model', 'none').strip().upper()
         solvent_name = self.config['orca'].get('solvent_name', 'water').strip()
         extra_keywords = self.config['orca'].get('extra_keywords', '').strip()
 
         solvent_kw = ''
-        if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
+        if solvent_model != 'NONE' and solvent_model in ['CPCM','SMD','COSMO']:
+            solvent_kw = f" {solvent_model}({solvent_name.capitalize()})"
 
         first_line = f"! {method} {basis} Opt{solvent_kw}"
         if extra_keywords:
             first_line += f" {extra_keywords}"
 
-        # Explicit output: ORCA by default writes .out; add %output for .log mirroring
-        # and ensure verbose printing so that primary output is always present
         control_blocks = [
             f"%pal nprocs {nprocs} end",
             f"%maxcore {maxcore}",
-            "%output\n  Print[ P_Basis ] 1\n  Print[ P_MOs ] 1\nend"
+            "%output",
+            "  Print[ P_Basis ] 1",
+            "  Print[ P_MOs ] 1",
+            "end",
         ]
 
         inp = [first_line, ''] + control_blocks + ['', f"* xyz {charge} {multiplicity}"]
@@ -142,8 +124,6 @@ class XYZHandler(FileSystemEventHandler):
         dst_inp = unique_path(self.waiting_dir / inp_path.name)
         shutil.move(str(xyz_path), str(dst_xyz))
         shutil.move(str(inp_path), str(dst_inp))
-        xyz_path = dst_xyz
-        inp_path = dst_inp
         logger.info(f"MOVE -> waiting: {dst_xyz.name}, {dst_inp.name}")
 
 
@@ -174,17 +154,14 @@ class ORCAPipeline:
         self.job_manager.start()
         self.notification_system.start_monitoring(self.job_manager)
         logger.info(f"MONITOR {input_dir}")
-        
         try:
             while True:
                 if self.job_manager.has_fatal_error():
                     logger.error("FATAL ERROR detected - stopping pipeline")
-                    self.stop()
-                    break
+                    self.stop(); break
                 time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("KEYBOARD INTERRUPT received")
-            self.stop()
+            logger.info("KEYBOARD INTERRUPT received"); self.stop()
 
     def stop(self):
         logger.info("STOP Shutting down...")
