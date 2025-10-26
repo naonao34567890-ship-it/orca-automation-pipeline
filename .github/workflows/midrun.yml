@@ -1,0 +1,137 @@
+name: ORCA Pipeline Mid-Run Detection Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mid-run-detection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install watchdog matplotlib configparser
+
+      - name: Create config
+        run: |
+          cat > config.txt << 'EOF'
+          [paths]
+          input_dir = folders/input
+          waiting_dir = folders/waiting
+          working_dir = folders/working
+          products_dir = folders/products
+
+          [orca]
+          orca_path = /usr/bin/mock_orca
+          orca_2mkl_path = /usr/bin/mock_orca_2mkl
+          generate_molden = true
+          method = B3LYP
+          basis_set = def2-SVP
+          charge = 0
+          multiplicity = 1
+          nprocs = 2
+          maxcore = 1024
+          max_parallel_jobs = 2
+          max_retries = 1
+
+          solvent_model = CPCM
+          solvent_name = Chloroform
+          extra_keywords = 
+
+          [gmail]
+          user = test@example.com
+          app_password = testpassword
+          recipient = test@example.com
+
+          [notification]
+          threshold = 3
+          debounce_seconds = 2
+          EOF
+
+      - name: Create mock ORCA executables
+        run: |
+          sudo tee /usr/bin/mock_orca << 'EOF'
+          #!/bin/bash
+          input_file="$1"
+          basename="${input_file%.inp}"
+          sleep 1
+          cat > "${basename}.out" << 'OUTEOF'
+          *** THE OPTIMIZATION HAS CONVERGED ***
+          CARTESIAN COORDINATES (ANGSTROEM)
+          C 0.000000 0.000000 0.000000
+          H 1.089000 0.000000 0.000000
+          H -0.363000 1.027000 0.000000
+          H -0.363000 -0.513500 0.889165
+          H -0.363000 -0.513500 -0.889165
+          OUTEOF
+          echo "mock" > "${basename}.gbw"
+          exit 0
+          EOF
+          
+          sudo tee /usr/bin/mock_orca_2mkl << 'EOF'
+          #!/bin/bash
+          basename="$1"
+          echo "molden" > "${basename}.molden.input"
+          exit 0
+          EOF
+          
+          sudo chmod +x /usr/bin/mock_orca /usr/bin/mock_orca_2mkl
+
+      - name: Start pipeline
+        run: |
+          python main.py &
+          echo $! > pipeline.pid
+          sleep 2
+
+      - name: Seed first molecule
+        run: |
+          mkdir -p folders/input
+          cat > folders/input/first.xyz << 'EOF'
+          5
+          First
+          C 0.0 0.0 0.0
+          H 1.0 0.0 0.0
+          H -0.3 0.9 0.0
+          H -0.3 -0.5 0.8
+          H -0.3 -0.5 -0.8
+          EOF
+          sleep 6
+
+      - name: Inject mid-run molecule
+        run: |
+          cat > folders/input/midrun.xyz << 'EOF'
+          3
+          MidRun
+          O 0.0 0.0 0.0
+          H 0.757 0.586 0.0
+          H -0.757 0.586 0.0
+          EOF
+          sleep 8
+
+      - name: Results summary
+        run: |
+          echo "=== Logs ===" 
+          tail -n 50 folders/logs/pipeline.log || true
+          echo "=== Waiting ==="
+          find folders/waiting -type f || true
+          echo "=== Products ==="
+          find folders/products -type f | sort || true
+
+      - name: Validate mid-run detection
+        run: |
+          # Check both molecules were processed
+          grep -q "DETECT New XYZ: first.xyz" folders/logs/pipeline.log
+          grep -q "DETECT New XYZ: midrun.xyz" folders/logs/pipeline.log
+          # Check products created for both
+          test $(find folders/products -type d -name "*success*" | wc -l) -ge 2
+
+      - name: Stop pipeline
+        if: always()
+        run: |
+          kill $(cat pipeline.pid) 2>/dev/null || true
