@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ORCA Job Management with recoverable/fatal error handling, energy plots, and system grouping
++ waiting cleanup after archive
 """
 
 import time
@@ -248,6 +249,18 @@ class JobManager:
         work_dir.rmdir()
         log.info(f"ARCHIVE {job.job_id} -> {target.relative_to(self.products_dir)}")
 
+        # ★ 追加: waiting の元ファイルをクリーンアップ
+        try:
+            wait_inp = self.waiting_dir / job.inp_path.name
+            wait_xyz = self.waiting_dir / job.xyz_path.name
+            if wait_inp.exists():
+                wait_inp.unlink()
+            if wait_xyz.exists():
+                wait_xyz.unlink()
+            log.info(f"CLEANUP waiting files: {wait_inp.name}, {wait_xyz.name}")
+        except Exception as e:
+            log.warning(f"Failed to cleanup waiting files: {e}")
+
         # Generate additional outputs for successful and recoverable failures
         if success or is_recoverable:
             self._generate_auxiliary_outputs(target, mol, job.job_type)
@@ -382,7 +395,6 @@ class JobManager:
         extra_keywords = self.config['orca'].get('extra_keywords', '').strip()
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            # Fixed: Remove 'Solvent=' for correct ORCA syntax  
             solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
         first = f"! {method} {basis} Freq{solvent_kw}"
         if extra_keywords:
