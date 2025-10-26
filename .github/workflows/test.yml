@@ -135,7 +135,7 @@ jobs:
         PIPELINE_PID=$!
         
         # Wait for startup
-        sleep 2
+        sleep 3
         
         # Create test XYZ file
         mkdir -p folders/input
@@ -150,7 +150,7 @@ jobs:
         EOF
         
         # Wait for processing
-        sleep 5
+        sleep 8
         
         # Check results
         echo "=== Directory Structure ==="
@@ -223,8 +223,8 @@ jobs:
         products_dir = folders/products
 
         [orca]
-        orca_path = ./mock_orca.sh
-        orca_2mkl_path = ./mock_orca_2mkl.sh
+        orca_path = /usr/bin/mock_orca
+        orca_2mkl_path = /usr/bin/mock_orca_2mkl
         generate_molden = true
         method = B3LYP
         basis_set = def2-SVP
@@ -249,8 +249,8 @@ jobs:
         debounce_seconds = 2
         EOF
         
-        # Create realistic mock ORCA with delayed output
-        cat > mock_orca.sh << 'EOF'
+        # Create mock executables in /usr/bin (accessible system-wide)
+        sudo tee /usr/bin/mock_orca << 'EOF'
         #!/bin/bash
         input_file="$1"
         basename="${input_file%.inp}"
@@ -258,48 +258,67 @@ jobs:
         # Simulate calculation time
         sleep 1
         
-        # Generate log output gradually (simulating real ORCA)
-        {
-          echo "ORCA PROGRAM SYSTEM"
-          sleep 0.5
-          echo "GEOMETRY OPTIMIZATION RUNNING"
-          sleep 0.5
-          echo "CYCLE     1 Energy: -40.123456"
-          sleep 0.5  
-          echo "CYCLE     2 Energy: -40.123465"
-          sleep 0.5
-          echo "CYCLE     3 Energy: -40.123467"
-          echo "***        THE OPTIMIZATION HAS CONVERGED     ***"
-          echo "FINAL SINGLE POINT ENERGY        -40.123467891"
-          echo ""
-          echo "CARTESIAN COORDINATES (ANGSTROEM)"
-          echo "C      0.000000    0.000000    0.000000"
-          echo "H      1.089000    0.000000    0.000000" 
-          echo "H     -0.363000    1.027000    0.000000"
-          echo "H     -0.363000   -0.513500    0.889165"
-          echo "H     -0.363000   -0.513500   -0.889165"
-          echo ""
-          echo "ORCA TERMINATED NORMALLY"
-        } > "${basename}.out"
+        # Generate realistic ORCA output
+        cat > "${basename}.out" << 'OUTEOF'
         
-        echo "Mock binary data $(date)" > "${basename}.gbw"
+                                         * O   R   C   A *
+        
+                           --- An Ab Initio, DFT and Semiempirical electronic structure package ---
+        
+        Input file name: ${input_file}
+        
+        ****************************
+        * Single Point Calculation *
+        ****************************
+        
+        FINAL SINGLE POINT ENERGY        -40.123456789012
+        
+        **********************
+        GEOMETRY OPTIMIZATION
+        **********************
+        
+        CYCLE    1
+        Total Energy:  -40.123456
+        
+        CYCLE    2
+        Total Energy:  -40.123465
+        
+        CYCLE    3
+        Total Energy:  -40.123467
+        
+                            ***        THE OPTIMIZATION HAS CONVERGED     ***
+        
+        FINAL SINGLE POINT ENERGY        -40.123467891
+        
+        CARTESIAN COORDINATES (ANGSTROEM)
+        C      0.000000    0.000000    0.000000
+        H      1.089000    0.000000    0.000000
+        H     -0.363000    1.027000    0.000000
+        H     -0.363000   -0.513500    0.889165
+        H     -0.363000   -0.513500   -0.889165
+        
+        ORCA TERMINATED NORMALLY
+        OUTEOF
+        
+        # Create mock gbw file
+        echo "Mock GBW binary data $(date)" > "${basename}.gbw"
         exit 0
         EOF
         
-        cat > mock_orca_2mkl.sh << 'EOF'  
+        sudo tee /usr/bin/mock_orca_2mkl << 'EOF'
         #!/bin/bash
         basename="$1"
         echo "Mock Molden file generated $(date)" > "${basename}.molden.input"
         exit 0
         EOF
         
-        chmod +x mock_orca.sh mock_orca_2mkl.sh
+        sudo chmod +x /usr/bin/mock_orca /usr/bin/mock_orca_2mkl
         
         # Start pipeline
         python main.py &
         PIPELINE_PID=$!
         
-        sleep 2
+        sleep 3
         
         # Test multiple molecules
         mkdir -p folders/input
@@ -316,7 +335,7 @@ jobs:
         EOF
         
         # Wait for first job
-        sleep 8
+        sleep 10
         
         # Molecule 2: Ethane  
         cat > folders/input/ethane.xyz << 'EOF'
@@ -333,7 +352,7 @@ jobs:
         EOF
         
         # Wait for processing
-        sleep 8
+        sleep 10
         
         # Results analysis
         echo "=== FINAL RESULTS ==="
@@ -357,18 +376,19 @@ jobs:
         
         # Stop pipeline
         kill $PIPELINE_PID 2>/dev/null || true
+        sleep 2
         
         # Validation
         inp_count=$(find folders -name "*.inp" | wc -l)
-        product_count=$(find folders/products -type d -name "*success*" 2>/dev/null | wc -l)
+        success_count=$(find folders/products -type d -name "*success*" 2>/dev/null | wc -l)
         
         echo -e "\n=== VALIDATION ==="
         echo "INP files generated: $inp_count"
-        echo "Successful products: $product_count"
+        echo "Successful products: $success_count"
         
-        if [ "$inp_count" -ge 2 ] && [ "$product_count" -ge 1 ]; then
+        if [ "$inp_count" -ge 2 ] && [ "$success_count" -ge 1 ]; then
           echo "✅ Pipeline test: PASS"
         else
-          echo "❌ Pipeline test: FAIL"
+          echo "❌ Pipeline test: FAIL - INP: $inp_count, Success: $success_count"
           exit 1
         fi
