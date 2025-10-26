@@ -382,7 +382,8 @@ class JobManager:
         extra_keywords = self.config['orca'].get('extra_keywords', '').strip()
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            solvent_kw = f" {solvent_model.upper()}(Solvent={solvent_name.capitalize()})"
+            # Fixed: Remove 'Solvent=' for correct ORCA syntax  
+            solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
         first = f"! {method} {basis} Freq{solvent_kw}"
         if extra_keywords:
             first += f" {extra_keywords}"
