@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller with robust XYZ parsing, retry logic, and watchdog API fix
+ORCA Automation Pipeline - Main Controller with robust XYZ parsing, retry logic, watchdog API fix, and explicit ORCA output directives
 """
 
 import time
@@ -61,7 +61,7 @@ class XYZHandler(FileSystemEventHandler):
                 lines = [line.strip() for line in lines if line.strip()]
                 
                 if len(lines) < 2:
-                    if attempt < 9:  # Not last attempt
+                    if attempt < 9:
                         time.sleep(0.2)
                         continue
                     raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines after {attempt+1} attempts)")
@@ -102,7 +102,7 @@ class XYZHandler(FileSystemEventHandler):
                 time.sleep(0.2)
                 continue
         
-        # Generate ORCA input
+        # Generate ORCA input with explicit log/output directives
         method = self.config['orca']['method']
         basis = self.config['orca']['basis_set']
         charge = int(self.config['orca']['charge'])
@@ -116,14 +116,21 @@ class XYZHandler(FileSystemEventHandler):
 
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            # Correct ORCA syntax: CPCM(Chloroform) not CPCM(Solvent=Chloroform)
             solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
 
         first_line = f"! {method} {basis} Opt{solvent_kw}"
         if extra_keywords:
             first_line += f" {extra_keywords}"
 
-        inp = [first_line, '', f"%pal nprocs {nprocs} end", f"%maxcore {maxcore}", '', f"* xyz {charge} {multiplicity}"]
+        # Explicit output: ORCA by default writes .out; add %output for .log mirroring
+        # and ensure verbose printing so that primary output is always present
+        control_blocks = [
+            f"%pal nprocs {nprocs} end",
+            f"%maxcore {maxcore}",
+            "%output\n  Print[ P_Basis ] 1\n  Print[ P_MOs ] 1\nend"
+        ]
+
+        inp = [first_line, ''] + control_blocks + ['', f"* xyz {charge} {multiplicity}"]
         inp.extend(coords)
         inp.append('*')
         return "\n".join(inp) + "\n"
@@ -155,7 +162,7 @@ class ORCAPipeline:
         return cfg
 
     def _setup_directories(self):
-        for d in ['folders/input', 'folders/waiting', 'folders/working', 'folders/products', 'folders/logs']:
+        for d in ['folders/input', 'folders/waiting', 'folders/working', 'folders/products', 'folders/logs', 'folders/state']:
             Path(d).mkdir(parents=True, exist_ok=True)
             logger.info(f"SETUP {d}")
 
@@ -170,7 +177,6 @@ class ORCAPipeline:
         
         try:
             while True:
-                # Check for fatal errors and stop pipeline if needed
                 if self.job_manager.has_fatal_error():
                     logger.error("FATAL ERROR detected - stopping pipeline")
                     self.stop()
