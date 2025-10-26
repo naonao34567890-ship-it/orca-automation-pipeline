@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller with fatal error pipeline stop
+ORCA Automation Pipeline - Main Controller with fatal error pipeline stop and watchdog API fix
 """
 
 import time
@@ -26,7 +26,13 @@ class XYZHandler(FileSystemEventHandler):
         self.waiting_dir = Path(config['paths']['waiting_dir'])
 
     def on_created(self, event):
-        if not event.is_dir and event.src_path.endswith('.xyz'):
+        # Fix for different watchdog API versions
+        if hasattr(event, 'is_directory'):
+            is_dir = event.is_directory
+        else:
+            is_dir = getattr(event, 'is_dir', False)
+            
+        if not is_dir and event.src_path.endswith('.xyz'):
             xyz_path = Path(event.src_path)
             logger.info(f"DETECT New XYZ: {xyz_path.name}")
             try:
@@ -69,7 +75,8 @@ class XYZHandler(FileSystemEventHandler):
 
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            solvent_kw = f" {solvent_model.upper()}(Solvent={solvent_name.capitalize()})"
+            # Fixed: Remove 'Solvent=' for correct ORCA syntax
+            solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
 
         first_line = f"! {method} {basis} Opt{solvent_kw}"
         if extra_keywords:
