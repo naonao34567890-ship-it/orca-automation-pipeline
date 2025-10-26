@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller with robust XYZ parsing, fatal stop, and watchdog API fix
+ORCA Automation Pipeline - Main Controller with robust XYZ parsing, retry logic, and watchdog API fix
 """
 
 import time
@@ -53,28 +53,56 @@ class XYZHandler(FileSystemEventHandler):
                 NotificationSystem.send_error(f"INP generation failed: {xyz_path.name}\nError: {e}")
 
     def _generate_inp_from_xyz(self, xyz_path: Path) -> str:
-        lines = xyz_path.read_text(encoding='utf-8', errors='ignore').splitlines()
-        if len(lines) < 2:
-            raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines)")
-        try:
-            num_atoms = int(lines[0].strip())
-        except Exception:
-            raise ValueError(f"Invalid XYZ header: {xyz_path.name} (first line must be atom count)")
-        if len(lines) < 2 + num_atoms:
-            raise ValueError(f"Invalid XYZ file: {xyz_path.name} (missing coordinate lines)")
-
-        coords = []
-        for i in range(2, 2 + num_atoms):
-            parts = lines[i].split()
-            if len(parts) < 4:
-                raise ValueError(f"Invalid coordinate format at line {i+1} in {xyz_path.name}")
-            element = parts[0]
+        # Retry logic for CI environment file buffering issues
+        for attempt in range(10):
             try:
-                x, y, z = map(float, parts[1:4])
-            except ValueError as ex:
-                raise ValueError(f"Invalid coordinate values at line {i+1} in {xyz_path.name}: {ex}")
-            coords.append(f"{element:>2} {x:>12.6f} {y:>12.6f} {z:>12.6f}")
-
+                lines = xyz_path.read_text(encoding='utf-8', errors='ignore').splitlines()
+                # Remove empty lines and normalize whitespace
+                lines = [line.strip() for line in lines if line.strip()]
+                
+                if len(lines) < 2:
+                    if attempt < 9:  # Not last attempt
+                        time.sleep(0.2)
+                        continue
+                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (too few lines after {attempt+1} attempts)")
+                
+                try:
+                    num_atoms = int(lines[0])
+                except ValueError:
+                    if attempt < 9:
+                        time.sleep(0.2)
+                        continue
+                    raise ValueError(f"Invalid XYZ header: {xyz_path.name} (first line must be atom count)")
+                
+                if len(lines) < 2 + num_atoms:
+                    if attempt < 9:
+                        time.sleep(0.2)
+                        continue
+                    raise ValueError(f"Invalid XYZ file: {xyz_path.name} (expected {2 + num_atoms} lines, got {len(lines)})")
+                
+                # Parse coordinates
+                coords = []
+                for i in range(2, 2 + num_atoms):
+                    parts = lines[i].split()
+                    if len(parts) < 4:
+                        raise ValueError(f"Invalid coordinate format at line {i+1} in {xyz_path.name}")
+                    element = parts[0]
+                    try:
+                        x, y, z = map(float, parts[1:4])
+                    except ValueError as ex:
+                        raise ValueError(f"Invalid coordinate values at line {i+1} in {xyz_path.name}: {ex}")
+                    coords.append(f"{element:>2} {x:>12.6f} {y:>12.6f} {z:>12.6f}")
+                
+                # Successful parsing, break retry loop
+                break
+                
+            except ValueError as e:
+                if attempt == 9:  # Last attempt
+                    raise e
+                time.sleep(0.2)
+                continue
+        
+        # Generate ORCA input
         method = self.config['orca']['method']
         basis = self.config['orca']['basis_set']
         charge = int(self.config['orca']['charge'])
@@ -88,7 +116,7 @@ class XYZHandler(FileSystemEventHandler):
 
         solvent_kw = ''
         if solvent_model != 'none' and solvent_model.upper() in ['CPCM','SMD','COSMO']:
-            # Correct ORCA syntax
+            # Correct ORCA syntax: CPCM(Chloroform) not CPCM(Solvent=Chloroform)
             solvent_kw = f" {solvent_model.upper()}({solvent_name.capitalize()})"
 
         first_line = f"! {method} {basis} Opt{solvent_kw}"
