@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ORCA Automation Pipeline - Main Controller (solvent & extra keywords) + logging + unique naming
+ORCA Automation Pipeline - Main Controller with fatal error pipeline stop
 """
 
 import time
@@ -31,7 +31,6 @@ class XYZHandler(FileSystemEventHandler):
             logger.info(f"DETECT New XYZ: {xyz_path.name}")
             try:
                 inp_content = self._generate_inp_from_xyz(xyz_path)
-                # first write alongside xyz, then move with unique name
                 tmp_inp = xyz_path.with_suffix('.inp')
                 tmp_inp.write_text(inp_content, encoding='utf-8')
                 self._move_to_waiting_unique(xyz_path, tmp_inp)
@@ -84,15 +83,10 @@ class XYZHandler(FileSystemEventHandler):
     def _move_to_waiting_unique(self, xyz_path: Path, inp_path: Path):
         import shutil
         self.waiting_dir.mkdir(parents=True, exist_ok=True)
-        # ensure unique targets
         dst_xyz = unique_path(self.waiting_dir / xyz_path.name)
         dst_inp = unique_path(self.waiting_dir / inp_path.name)
         shutil.move(str(xyz_path), str(dst_xyz))
         shutil.move(str(inp_path), str(dst_inp))
-        # rename local names to final for job creation
-        xyz_path.rename(dst_xyz) if xyz_path.exists() else None
-        inp_path.rename(dst_inp) if inp_path.exists() else None
-        # overwrite names so caller picks waiting versions
         xyz_path = dst_xyz
         inp_path = dst_inp
         logger.info(f"MOVE -> waiting: {dst_xyz.name}, {dst_inp.name}")
@@ -125,10 +119,17 @@ class ORCAPipeline:
         self.job_manager.start()
         self.notification_system.start_monitoring(self.job_manager)
         logger.info(f"MONITOR {input_dir}")
+        
         try:
             while True:
+                # Check for fatal errors and stop pipeline if needed
+                if self.job_manager.has_fatal_error():
+                    logger.error("FATAL ERROR detected - stopping pipeline")
+                    self.stop()
+                    break
                 time.sleep(1)
         except KeyboardInterrupt:
+            logger.info("KEYBOARD INTERRUPT received")
             self.stop()
 
     def stop(self):
@@ -139,5 +140,4 @@ class ORCAPipeline:
 
 
 if __name__ == '__main__':
-    import time
     ORCAPipeline().start()
